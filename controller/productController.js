@@ -5,6 +5,29 @@ const mongoose = require('mongoose');
 const Shipping = require('../models/Shipping');
 const seoService = require('../utils/seoService');
 
+// Normalize categories coming from multipart form data into a clean string array.
+// Handles: '["Makeup","Lip"]' (legacy JSON string), arrays with JSON-string
+// elements, nested arrays, and plain strings.
+function normalizeCategories(val) {
+  const out = [];
+  const push = (item) => {
+    if (Array.isArray(item)) { item.forEach(push); return; }
+    if (typeof item !== 'string') return;
+    const t = item.trim();
+    if (!t) return;
+    try {
+      const p = JSON.parse(t);
+      if (Array.isArray(p)) { p.forEach(push); return; }
+      if (typeof p === 'string') { push(p); return; } // recurse: legacy double-encoded strings
+      out.push(String(p));
+      return;
+    } catch {}
+    out.push(t);
+  };
+  push(val);
+  return out.filter(Boolean);
+}
+
 // Socket.io instance (set from server.js)
 let ioInstance = null;
 
@@ -58,7 +81,7 @@ const addProduct = async (req, res) => {
 
     const newProduct = new Product({
       name: req.body.name,
-      categories: req.body.categories,
+      categories: normalizeCategories(req.body.categories),
       brand: req.body.brand,
       broadcast: req.body.broadcast === 'true' || req.body.broadcast === true,
       mainPrice: req.body.mainPrice,
@@ -165,7 +188,7 @@ const updateProduct = async (req, res) => {
       : req.body.variants;
 
     product.name = req.body.name || product.name;
-    product.categories = req.body.categories || product.categories;
+    if (req.body.categories !== undefined) product.categories = normalizeCategories(req.body.categories);
     product.brand = req.body.brand || product.brand;
     if (req.body.broadcast !== undefined) product.broadcast = req.body.broadcast === 'true' || req.body.broadcast === true;
     product.mainPrice = req.body.mainPrice || product.mainPrice;
@@ -244,10 +267,15 @@ const updateProduct = async (req, res) => {
       return merged;
     }));
 
+    // Apply manually-edited SEO submitted with the form (JSON string from multipart)
+    if (req.body.seo) {
+      try { product.seo = JSON.parse(req.body.seo); } catch (e) { /* keep existing */ }
+    }
+
     await product.save();
     
-    // Auto-regenerate SEO in background
-    seoService.generateSEO(product).catch(err => console.error('SEO gen error:', err));
+    // Fill/refresh auto-generated SEO in background — never overwrites manual edits
+    seoService.generateSEO(product, { force: false }).catch(err => console.error('SEO gen error:', err));
     
     // Emit product update event
     emitProductUpdate(product._id, 'product_updated', {
@@ -676,6 +704,42 @@ async function purchaseBroadcast(req, res) {
   }
 }
 
+// ======================
+// Generate SKUs for products missing one
+// ======================
+async function generateSKUs(req, res) {
+  try {
+    const missing = await Product.find({
+      $or: [{ sku: { $exists: false } }, { sku: null }, { sku: '' }]
+    }).select('name');
+
+    if (!missing.length) return res.json({ count: 0 });
+
+    const existing = new Set(
+      (await Product.find({ sku: { $exists: true, $nin: [null, ''] } }).select('sku'))
+        .map((p) => p.sku)
+    );
+
+    let count = 0;
+    for (const product of missing) {
+      const base = (product.name || 'PRD').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4) || 'PRD';
+      let sku = null;
+      for (let attempt = 0; attempt < 25; attempt++) {
+        const suffix = Math.random().toString(36).slice(2, 6).toUpperCase().padEnd(4, 'X');
+        const candidate = `${base}-${suffix}`;
+        if (!existing.has(candidate)) { sku = candidate; break; }
+      }
+      if (!sku) continue;
+      existing.add(sku);
+      await Product.updateOne({ _id: product._id }, { $set: { sku } });
+      count++;
+    }
+    res.json({ count });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to generate SKUs', error: error.message });
+  }
+}
+
 // Set Socket.IO instance
 const setSocketIO = (io) => {
   ioInstance = io;
@@ -683,6 +747,7 @@ const setSocketIO = (io) => {
 
 module.exports = {
   addProduct,
+  generateSKUs,
   updateProduct,
   deleteProduct,
   getProducts,

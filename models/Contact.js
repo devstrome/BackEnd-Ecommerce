@@ -55,7 +55,14 @@ const contactSchema = new mongoose.Schema({
   userAgent: {
     type: String,
     trim: true
-  }
+  },
+  // Outgoing replies sent from the admin panel via the server email account
+  replies: [{
+    subject: { type: String, trim: true },
+    message: { type: String },
+    sentAt: { type: Date, default: Date.now },
+    sentBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin' }
+  }]
 }, {
   timestamps: true
 });

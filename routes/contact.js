@@ -9,7 +9,8 @@ const {
   getContactStats,
   markAsResolved,
   bulkUpdateContacts,
-  exportContacts
+  exportContacts,
+  replyToContact
 } = require('../controller/contactController');
 
 const { isAuthenticatedAdmin } = require('../middleware/auth');
@@ -20,6 +21,7 @@ router.post('/submit', submitContact);
 // Admin routes (protected)
 router.get('/admin/contacts', isAuthenticatedAdmin, getAllContacts);
 router.get('/admin/contacts/:id', isAuthenticatedAdmin, getContact);
+router.post('/admin/contacts/:id/reply', isAuthenticatedAdmin, replyToContact);
 router.put('/admin/contacts/:id', isAuthenticatedAdmin, updateContactStatus);
 router.delete('/admin/contacts/:id', isAuthenticatedAdmin, deleteContact);
 router.get('/admin/stats', isAuthenticatedAdmin, getContactStats);

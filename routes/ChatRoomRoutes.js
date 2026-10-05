@@ -3,6 +3,13 @@ const router = express.Router();
 const ChatController = require("../controller/ChatRoomController");
 const { authenticateAdmin } = require("../middleware/AdminAuthMiddleware");
 const authenticate = require("../middleware/UserAuthMiddleware");
+const upload = require("../config/multerconfig");
+
+// Chat image upload (authenticated customer) - CloudinaryStorage returns the URL
+router.post("/user/upload/chat-image", authenticate, upload.single("image"), (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, message: "No image file provided" });
+  return res.json({ success: true, url: req.file.path });
+});
 
 // Customer Routes
 router.get("/user/rooms/:customerId", authenticate, ChatController.getOrCreateRoom);

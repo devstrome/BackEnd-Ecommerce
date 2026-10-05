@@ -1,6 +1,34 @@
 const Contact = require('../models/Contact');
 const catchAsyncErrors = require('../middleware/catchAsyncErrors');
 const ErrorHandler = require('../utils/errorHandler');
+const { sendCustomEmail } = require('../utils/emailService');
+
+const escapeHtml = (s = '') => String(s).replace(/[&<>"']/g, (c) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+));
+
+const buildReplyHtml = (contact, subject, message) => {
+  const bodyHtml = escapeHtml(message).replace(/\n/g, '<br/>');
+  return `
+    <div style="font-family: Arial, Helvetica, sans-serif; max-width: 600px; margin: 0 auto; color: #1B1B1B;">
+      <div style="background: #B1123B; padding: 24px; text-align: center; color: #fff; border-radius: 8px 8px 0 0;">
+        <h1 style="margin: 0; font-size: 22px; letter-spacing: 3px;">BELORELLA</h1>
+      </div>
+      <div style="border: 1px solid #eee; border-top: none; padding: 24px; border-radius: 0 0 8px 8px;">
+        <p>Hi ${escapeHtml(contact.name || 'there')},</p>
+        <p>Thank you for contacting us regarding <strong>&ldquo;${escapeHtml(contact.subject || 'your message')}&rdquo;</strong>.</p>
+        <div style="background: #F8F8F8; border-left: 4px solid #B1123B; padding: 16px; margin: 16px 0; line-height: 1.6;">
+          ${bodyHtml}
+        </div>
+        <p>If you have any further questions, simply reply to this email — we are happy to help.</p>
+        <p>Best regards,<br/><strong>Belorella Support</strong></p>
+      </div>
+      <p style="font-size: 12px; color: #888; text-align: center; margin-top: 16px;">
+        &copy; ${new Date().getFullYear()} Belorella. All rights reserved.
+      </p>
+    </div>
+  `;
+};
 
 // Submit contact form (Public)
 exports.submitContact = catchAsyncErrors(async (req, res, next) => {
@@ -248,5 +276,50 @@ exports.exportContacts = catchAsyncErrors(async (req, res, next) => {
       dateRange: startDate && endDate ? `${startDate} to ${endDate}` : 'All time',
       status: status || 'All statuses'
     }
+  });
+});
+
+// Send a reply email to a contact through the server email account (Admin)
+exports.replyToContact = catchAsyncErrors(async (req, res, next) => {
+  const { id } = req.params;
+  const subject = (req.body.subject || '').trim();
+  const message = (req.body.message || '').trim();
+
+  if (!subject) return res.status(400).json({ success: false, message: 'Subject is required' });
+  if (!message) return res.status(400).json({ success: false, message: 'Message is required' });
+  if (subject.length > 200) return res.status(400).json({ success: false, message: 'Subject cannot exceed 200 characters' });
+  if (message.length > 5000) return res.status(400).json({ success: false, message: 'Message cannot exceed 5000 characters' });
+
+  const contact = await Contact.findById(id);
+  if (!contact) return res.status(404).json({ success: false, message: 'Contact not found' });
+
+  const result = await sendCustomEmail({
+    to: contact.email,
+    subject,
+    html: buildReplyHtml(contact, subject, message),
+    text: message
+  });
+
+  if (!result.success) {
+    return res.status(502).json({
+      success: false,
+      message: result.message || result.error || 'Failed to send email'
+    });
+  }
+
+  contact.replies = contact.replies || [];
+  contact.replies.push({
+    subject,
+    message,
+    sentAt: new Date(),
+    sentBy: req.admin?._id
+  });
+  await contact.save();
+
+  res.status(200).json({
+    success: true,
+    message: 'Reply sent successfully',
+    reply: contact.replies[contact.replies.length - 1],
+    messageId: result.messageId
   });
 });

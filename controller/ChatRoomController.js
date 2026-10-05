@@ -302,25 +302,50 @@ exports.addReaction = async (req, res) => {
       throw new NotFoundError('Message not found');
     }
 
-    // Toggle reaction if same user, or set new reaction
-    msg.reaction = msg.reaction === emoji ? "" : emoji;
-    msg.reactedBy = userId;
+    // Toggle this user's reaction (Messenger-style: same emoji again removes it)
+    if (!msg.reactions) msg.reactions = [];
+    const senderType = req.admin ? 'admin' : 'customer';
+    const existingIdx = msg.reactions.findIndex(r => String(r.userId) === String(userId));
+    let action = 'added';
+    if (existingIdx >= 0) {
+      if (msg.reactions[existingIdx].emoji === emoji) {
+        msg.reactions.splice(existingIdx, 1);
+        action = 'removed';
+      } else {
+        msg.reactions[existingIdx].emoji = emoji;
+        action = 'updated';
+      }
+    } else {
+      msg.reactions.push({
+        emoji,
+        userId,
+        senderType,
+        userName: req.admin ? (req.admin.firstName || 'Admin') : (req.user?.firstName || 'User'),
+        createdAt: new Date()
+      });
+    }
+    msg.reaction = msg.reactions.length ? msg.reactions[0].emoji : '';
     await room.save();
 
     // Notify via socket
     const io = req.app.get('socketio');
     if (io) {
-      io.to(`chat_${roomId}`).emit("messageUpdated", { 
-        messageId, 
+      const eventData = {
+        messageId,
+        reactions: msg.reactions,
         reaction: msg.reaction,
-        reactedBy: userId
-      });
+        action,
+        roomId
+      };
+      io.to(`chat_${roomId}`).emit("messageUpdated", eventData);
+      io.to('adminRoom').emit("messageUpdated", eventData);
     }
 
     res.json({
       messageId,
+      reactions: msg.reactions,
       reaction: msg.reaction,
-      reactedBy: userId
+      action
     });
   } catch (err) {
     console.error('Error in addReaction:', err);

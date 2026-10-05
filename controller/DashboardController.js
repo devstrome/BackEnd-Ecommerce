@@ -95,19 +95,55 @@ exports.getDashboardStats = catchAsyncErrors(async (req, res, next) => {
     .sort({ createdAt: -1 })
     .limit(5);
 
-  // Top selling products (based on order items)
+  // Top selling products (based on order items) — grouped per product with per-variant breakdown
   const topProducts = await Order.aggregate([
     { $match: { isActive: true } },
     { $unwind: '$items' },
-    { $group: { 
-      _id: '$items.productId', 
-      totalQuantity: { $sum: '$items.quantity' },
-      totalRevenue: { $sum: { $multiply: ['$items.price', '$items.quantity'] } }
-    }},
+    {
+      $group: {
+        _id: {
+          productId: '$items.productId',
+          variantId: '$items.variantId',
+          size: '$items.size',
+          color: '$items.color',
+        },
+        itemName: { $first: '$items.name' },
+        mainImage: { $first: '$items.mainImage' },
+        totalQuantity: { $sum: '$items.quantity' },
+        totalRevenue: { $sum: { $multiply: ['$items.price', '$items.quantity'] } },
+      },
+    },
     { $sort: { totalQuantity: -1 } },
+    {
+      $group: {
+        _id: '$_id.productId',
+        totalQuantity: { $sum: '$totalQuantity' },
+        totalRevenue: { $sum: '$totalRevenue' },
+        variants: {
+          $push: {
+            variantId: '$_id.variantId',
+            size: '$_id.size',
+            color: '$_id.color',
+            name: '$itemName',
+            mainImage: '$mainImage',
+            totalQuantity: '$totalQuantity',
+            totalRevenue: '$totalRevenue',
+          },
+        },
+      },
+    },
+    { $sort: { totalQuantity: -1, totalRevenue: -1 } },
     { $limit: 5 },
-    { $lookup: { from: 'products', localField: '_id', foreignField: '_id', as: 'product' }},
-    { $unwind: '$product' }
+    { $lookup: { from: 'products', localField: '_id', foreignField: '_id', as: 'product' } },
+    { $unwind: '$product' },
+    {
+      $project: {
+        totalQuantity: 1,
+        totalRevenue: 1,
+        variants: 1,
+        product: { name: 1, mainImage: 1, brand: 1, mainPrice: 1, discountPrice: 1 },
+      },
+    },
   ]);
 
   // Sales trend for the last 7 days

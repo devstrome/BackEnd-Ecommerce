@@ -651,6 +651,34 @@ const sendEmail = async (to, template, data) => {
   }
 };
 
+// Send a free-form email (admin replies, custom notices) through the server email account
+const sendCustomEmail = async ({ to, subject, html, text }) => {
+  try {
+    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASSWORD) {
+      console.log('⚠️ Email credentials not configured. Skipping email send.');
+      return { success: false, message: 'Email credentials not configured' };
+    }
+    if (!to || !subject) {
+      return { success: false, message: 'Recipient and subject are required' };
+    }
+
+    const mailOptions = {
+      from: `"Belorella" <${process.env.EMAIL_USER}>`,
+      to,
+      subject,
+      html,
+      text
+    };
+
+    const result = await transporter.sendMail(mailOptions);
+    console.log(`✅ Custom email sent to ${to}: ${subject}`);
+    return { success: true, messageId: result.messageId };
+  } catch (error) {
+    console.error(`❌ Failed to send custom email to ${to}:`, error.message);
+    return { success: false, error: error.message };
+  }
+};
+
 // Send order confirmation email
 const sendOrderConfirmation = async (order, user) => {
   return await sendEmail(user.email, 'orderConfirmation', { order, user });
@@ -992,6 +1020,7 @@ const sendPOSReceipt = async (posOrder) => {
 
 module.exports = {
   sendEmail,
+  sendCustomEmail,
   sendOrderConfirmation,
   sendOrderProcessing,
   sendOrderShipped,

@@ -6,7 +6,7 @@ const storage = new CloudinaryStorage({
     cloudinary:cloudinary,
     params:{
         folder:"BackEnd-Test",
-        allowedFormats:["jpg","png","heic"]
+        allowedFormats:["jpg","jpeg","png","webp","heic"]
     }
 })
 

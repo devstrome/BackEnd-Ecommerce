@@ -17,7 +17,8 @@ const {
   toggleLike,
   toggleWishlist,
   getWishlist,
-  purchaseBroadcast
+  purchaseBroadcast,
+  generateSKUs
 } = require('../controller/productController');
 
 
@@ -41,6 +42,7 @@ router.post(
 
 
 router.get('/products',  getProducts);
+router.post('/products/generate-skus', authenticateAdmin, generateSKUs);
 router.get('/products/:id',  getSingleProduct);
 // Reviews
 router.get('/products/:id/reviews', getReviews);

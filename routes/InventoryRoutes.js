@@ -18,8 +18,9 @@ const {
 
 const { authenticateAdmin } = require('../middleware/AdminAuthMiddleware');
 
-// All routes require admin authentication
-router.use(authenticateAdmin);
+// All inventory routes require admin authentication
+// (scoped to /inventory so this router does not intercept other /api routes)
+router.use('/inventory', authenticateAdmin);
 
 // Get all inventory items with pagination and filters
 router.get('/inventory', getAllInventory);

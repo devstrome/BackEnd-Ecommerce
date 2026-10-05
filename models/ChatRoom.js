@@ -19,9 +19,37 @@ const MessageSchema = new mongoose.Schema({
   },
   text: {
     type: String,
-    required: true
+    default: ""
+  },
+  image: {
+    type: String,
+    default: ""
   },
   reaction: {
+    type: String,
+    default: ""
+  },
+  reactions: [{
+    _id: false,
+    emoji: { type: String, required: true },
+    userId: { type: String, required: true },
+    senderType: { type: String, enum: ['customer', 'admin'], default: 'customer' },
+    userName: { type: String, default: "" },
+    createdAt: { type: Date, default: Date.now }
+  }],
+  edited: {
+    type: Boolean,
+    default: false
+  },
+  isDeleted: {
+    type: Boolean,
+    default: false
+  },
+  guestId: {
+    type: String,
+    default: ""
+  },
+  senderName: {
     type: String,
     default: ""
   },

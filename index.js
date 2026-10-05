@@ -29,6 +29,7 @@ const OrderRoutes = require('./routes/OrderRoutes');
 const MeasureTypeRoutes = require('./routes/MeasureTypeRoutes');
 const ChatRoomRoutes = require('./routes/ChatRoomRoutes');
 const ShippingRoutes = require('./routes/ShippingRoutes');
+const CheckoutRuleRoutes = require('./routes/CheckoutRuleRoutes');
 const ContactRoutes = require('./routes/contact');
 const TopRatedSlidesRoutes = require('./routes/TopRatedSlidesRoute');
 const InventoryRoutes = require('./routes/InventoryRoutes');
@@ -38,6 +39,11 @@ const DashboardRoutes = require('./routes/DashboardRoutes');
 const PopupAdRoutes = require('./routes/popupAdRoutes');
 const EmbeddingRoutes = require('./routes/EmbeddingRoutes');
 const SeoRoutes = require('./routes/SeoRoutes');
+const HeroSlideRoutes = require('./routes/HeroSlideRoutes');
+const AnnouncementRoutes = require('./routes/AnnouncementRoutes');
+const SubscriberRoutes = require('./routes/SubscriberRoutes');
+const HelpPageRoutes = require('./routes/HelpPageRoutes');
+const BlogRoutes = require('./routes/BlogRoutes');
 const { chat, history, clear } = require('./controller/AIAssistantController');
 const authenticate = require('./middleware/UserAuthMiddleware');
 
@@ -94,6 +100,7 @@ app.use('/api', OrderRoutes);
 app.use('/api', MeasureTypeRoutes);
 app.use('/api', ChatRoomRoutes);
 app.use('/api', ShippingRoutes);
+app.use('/api', CheckoutRuleRoutes);
 app.use('/api/contact', ContactRoutes);
 app.use('/api', TopRatedSlidesRoutes);
 app.use('/api', InventoryRoutes);
@@ -103,6 +110,11 @@ app.use('/api/dashboard', DashboardRoutes);
 app.use('/api', PopupAdRoutes);
 app.use('/api', EmbeddingRoutes);
 app.use('/api', SeoRoutes);
+app.use('/api', HeroSlideRoutes);
+app.use('/api', AnnouncementRoutes);
+app.use('/api', SubscriberRoutes);
+app.use('/api', HelpPageRoutes);
+app.use('/api', BlogRoutes);
 
 // ==============================
 // Socket.IO Configuration
@@ -152,6 +164,8 @@ const connectedUsers = new Map();
 const productViewers = new Map();
 // Track which products a socket is viewing: socketId -> Set(productId)
 const socketProducts = new Map();
+// Expose viewer tracking to routes (live viewers dashboard)
+app.set('productViewers', productViewers);
 // Track user online status: userId -> { socketId, lastActivity, userType }
 const userOnlineStatus = new Map();
 
@@ -317,9 +331,11 @@ io.on('connection', (socket) => {
   });
 
   socket.on('sendMessage', async (message) => {
-    const { roomId, senderId, senderType, text } = message;
-    if (!roomId || !senderId || !text) {
-      console.log('❌ sendMessage: Missing required fields', { roomId, senderId, text });
+    const { roomId, senderId, senderType, text, image, tempId } = message;
+    const hasText = typeof text === 'string' && text.trim().length > 0;
+    const hasImage = typeof image === 'string' && image.trim().length > 0;
+    if (!roomId || !senderId || (!hasText && !hasImage)) {
+      console.log('❌ sendMessage: Missing required fields', { roomId, senderId, text, image });
       return;
     }
     
@@ -350,8 +366,10 @@ io.on('connection', (socket) => {
             _id: new mongoose.Types.ObjectId(), // Explicitly set _id
             senderId, 
             senderType, 
-            text,
+            text: hasText ? text : '',
+            image: hasImage ? image : '',
             reaction: "",
+            reactions: [],
             readBy: [{
               readerType: senderType,
               readerId: senderId,
@@ -389,9 +407,9 @@ io.on('connection', (socket) => {
         io.to(`chat_${roomId}`).emit('messageReceived', messageData);
         io.to('adminRoom').emit('messageReceived', messageData);
         
-        // Emit message confirmation for temporary messages
+        // Emit message confirmation for temporary messages (echo the sender's tempId back)
         io.to(`chat_${roomId}`).emit('messageConfirmed', {
-          tempId: `temp_${Date.now()}`,
+          tempId: tempId || `temp_${Date.now()}`,
           realId: savedMessage._id,
           updates: {
             _id: savedMessage._id,
@@ -406,6 +424,153 @@ io.on('connection', (socket) => {
       console.error('❌ Error saving message:', error);
       // Emit error back to sender
       socket.emit('messageError', { error: 'Failed to save message' });
+    }
+  });
+
+  // Toggle an emoji reaction on a message (both client and admin sides emit this)
+  socket.on('addReaction', async (payload) => {
+    try {
+      const { roomId, messageId, emoji, userId, userName } = payload || {};
+      if (!roomId || !messageId || !emoji) {
+        console.log('❌ addReaction: Missing required fields', { roomId, messageId, emoji });
+        return;
+      }
+
+      const ChatRoom = require('./models/ChatRoom');
+      const room = await ChatRoom.findById(roomId);
+      if (!room) {
+        console.log('❌ addReaction: Room not found', roomId);
+        return;
+      }
+
+      const msg = room.messages.id(messageId);
+      if (!msg) {
+        console.log('❌ addReaction: Message not found', messageId);
+        return;
+      }
+
+      const senderType = payload.senderType === 'admin' ? 'admin' : 'customer';
+      if (!msg.reactions) msg.reactions = [];
+
+      const existingIdx = msg.reactions.findIndex(r => String(r.userId) === String(userId));
+      let action = 'added';
+      if (existingIdx >= 0) {
+        if (msg.reactions[existingIdx].emoji === emoji) {
+          msg.reactions.splice(existingIdx, 1);
+          action = 'removed';
+        } else {
+          msg.reactions[existingIdx].emoji = emoji;
+          action = 'updated';
+        }
+      } else {
+        msg.reactions.push({
+          emoji,
+          userId,
+          senderType,
+          userName: userName || '',
+          createdAt: new Date()
+        });
+      }
+
+      // Keep legacy single-reaction field in sync for older clients
+      msg.reaction = msg.reactions.length ? msg.reactions[0].emoji : '';
+
+      await room.save();
+
+      const eventData = {
+        messageId,
+        reactions: msg.reactions,
+        reaction: msg.reaction,
+        action,
+        roomId
+      };
+      io.to(`chat_${roomId}`).emit('messageUpdated', eventData);
+      io.to('adminRoom').emit('messageUpdated', eventData);
+
+      console.log(`👍 Reaction ${action} on ${messageId} in chat_${roomId}: ${emoji}`);
+    } catch (error) {
+      console.error('❌ Error adding reaction:', error);
+    }
+  });
+
+  // Edit own message (broadcast to both sides)
+  socket.on('editMessage', async ({ roomId, messageId, text, senderId }) => {
+    try {
+      if (!roomId || !messageId || !senderId) {
+        console.log('❌ editMessage: Missing required fields', { roomId, messageId, senderId });
+        return;
+      }
+      const ChatRoom = require('./models/ChatRoom');
+      const room = await ChatRoom.findById(roomId);
+      if (!room) return;
+      const msg = room.messages.id(messageId);
+      if (!msg) {
+        socket.emit('messageError', { error: 'Message not found' });
+        return;
+      }
+      if (String(msg.senderId) !== String(senderId)) {
+        socket.emit('messageError', { error: 'Not allowed to edit this message' });
+        return;
+      }
+      if (msg.isDeleted) return;
+      const newText = typeof text === 'string' ? text.trim() : '';
+      if (!newText && !msg.image) {
+        socket.emit('messageError', { error: 'Message text required' });
+        return;
+      }
+      msg.text = newText;
+      msg.edited = true;
+      await room.save();
+
+      const eventData = { messageId, updates: { text: msg.text, edited: true }, roomId };
+      io.to(`chat_${roomId}`).emit('messageUpdated', eventData);
+      io.to('adminRoom').emit('messageUpdated', eventData);
+      console.log(`✏️ Message ${messageId} edited in chat_${roomId}`);
+    } catch (error) {
+      console.error('❌ Error editing message:', error);
+      socket.emit('messageError', { error: 'Failed to edit message' });
+    }
+  });
+
+  // Delete own message (soft delete, broadcast to both sides)
+  socket.on('deleteMessage', async ({ roomId, messageId, senderId }) => {
+    try {
+      if (!roomId || !messageId || !senderId) {
+        console.log('❌ deleteMessage: Missing required fields', { roomId, messageId, senderId });
+        return;
+      }
+      const ChatRoom = require('./models/ChatRoom');
+      const room = await ChatRoom.findById(roomId);
+      if (!room) return;
+      const msg = room.messages.id(messageId);
+      if (!msg) {
+        socket.emit('messageError', { error: 'Message not found' });
+        return;
+      }
+      if (String(msg.senderId) !== String(senderId)) {
+        socket.emit('messageError', { error: 'Not allowed to delete this message' });
+        return;
+      }
+      if (msg.isDeleted) return;
+      msg.isDeleted = true;
+      msg.text = '';
+      msg.image = '';
+      msg.edited = false;
+      msg.reactions = [];
+      msg.reaction = '';
+      await room.save();
+
+      const eventData = {
+        messageId,
+        updates: { isDeleted: true, text: '', image: '', edited: false, reactions: [], reaction: '' },
+        roomId
+      };
+      io.to(`chat_${roomId}`).emit('messageUpdated', eventData);
+      io.to('adminRoom').emit('messageUpdated', eventData);
+      console.log(`🗑️ Message ${messageId} deleted in chat_${roomId}`);
+    } catch (error) {
+      console.error('❌ Error deleting message:', error);
+      socket.emit('messageError', { error: 'Failed to delete message' });
     }
   });
 
@@ -424,6 +589,7 @@ io.on('connection', (socket) => {
     socket.join(`product_${productId}`);
     const count = productViewers.get(productId).size;
     io.to(`product_${productId}`).emit('viewerCountUpdate', count);
+    io.to('adminRoom').emit('viewerCountUpdate', { productId, viewerCount: count });
     console.log(`👀 Socket ${socket.id} joined product ${productId}. Viewers: ${count}`);
   });
 
@@ -433,6 +599,7 @@ io.on('connection', (socket) => {
       productViewers.get(productId).delete(socket.id);
       const count = productViewers.get(productId).size;
       io.to(`product_${productId}`).emit('viewerCountUpdate', count);
+      io.to('adminRoom').emit('viewerCountUpdate', { productId, viewerCount: count });
       console.log(`👋 Socket ${socket.id} left product ${productId}. Viewers: ${count}`);
     }
     socket.leave(`product_${productId}`);
@@ -486,36 +653,36 @@ io.on('connection', (socket) => {
           if (hasChanges) {
             await room.save();
             console.log(`👁️ Messages marked as read in chat_${roomId} by ${readerId} (${readerType})`);
+
+            // Emit read status update to all users in the room (only when something changed)
+            io.to(`chat_${roomId}`).emit('readStatusUpdated', { 
+              roomId, 
+              readerType, 
+              readerId,
+              readAt: new Date(),
+              messageCount: room.messages.length
+            });
+            
+            // Emit message status updates for each message
+            room.messages.forEach(message => {
+              io.to(`chat_${roomId}`).emit('messageStatusUpdated', {
+                messageId: message._id,
+                updates: {
+                  readBy: message.readBy
+                }
+              });
+            });
+            
+            // Emit to admin room for real-time updates
+            io.to('adminRoom').emit('readStatusUpdated', {
+              roomId,
+              readerType,
+              readerId,
+              readAt: new Date()
+            });
           } else {
             console.log(`👁️ No new messages to mark as read in chat_${roomId} by ${readerId} (${readerType})`);
           }
-          
-          // Emit read status update to all users in the room
-          io.to(`chat_${roomId}`).emit('readStatusUpdated', { 
-            roomId, 
-            readerType, 
-            readerId,
-            readAt: new Date(),
-            messageCount: room.messages.length
-          });
-          
-          // Emit message status updates for each message
-          room.messages.forEach(message => {
-            io.to(`chat_${roomId}`).emit('messageStatusUpdated', {
-              messageId: message._id,
-              updates: {
-                readBy: message.readBy
-              }
-            });
-          });
-          
-          // Emit to admin room for real-time updates
-          io.to('adminRoom').emit('readStatusUpdated', {
-            roomId,
-            readerType,
-            readerId,
-            readAt: new Date()
-          });
           
           break; // Success, exit retry loop
           
@@ -740,6 +907,7 @@ io.on('connection', (socket) => {
           productViewers.get(pid).delete(socket.id);
           const count = productViewers.get(pid).size;
           io.to(`product_${pid}`).emit('viewerCountUpdate', count);
+          io.to('adminRoom').emit('viewerCountUpdate', { productId: pid, viewerCount: count });
         }
       });
       socketProducts.delete(socket.id);

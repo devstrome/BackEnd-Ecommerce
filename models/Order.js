@@ -56,6 +56,28 @@ const orderSchema = new mongoose.Schema({
   discountAmount: { type: Number, default: 0 },
   shipping: { type: shippingMethodSchema, default: {} },
   shippingCost: { type: Number, default: 0 },
+  // 🔹 Checkout rule extras (handling fees etc. computed by checkout rule engine)
+  extraFees: {
+    type: [{
+      label: { type: String },
+      amount: { type: Number },
+      ruleId: { type: String },
+      _id: false,
+    }],
+    default: [],
+  },
+  extraFeeTotal: { type: Number, default: 0 },
+  checkoutRulesApplied: {
+    type: [{
+      ruleId: { type: String },
+      name: { type: String },
+      type: { type: String },
+      value: { type: Number },
+      message: { type: String },
+      _id: false,
+    }],
+    default: [],
+  },
   grandTotal: { type: Number, default: 0 },
   couponCode: { type: String, default: null }, // Changed from couponId (ObjectId) to couponCode (String)
   couponId: { type: mongoose.Schema.Types.ObjectId, ref: 'Coupon', default: null }, // Keep both for backward compatibility
@@ -81,6 +103,19 @@ const orderSchema = new mongoose.Schema({
     enum: ['pending', 'processing', 'shipped', 'delivered', 'cancelled'],
     default: 'pending',
   },
+  // 🔹 Refund request workflow (user requests, admin approves/rejects)
+  refundStatus: {
+    type: String,
+    enum: ['none', 'pending', 'approved', 'rejected'],
+    default: 'none',
+  },
+refundReason: { type: String, default: '' },
+refundNote: { type: String, default: '' },
+refundImage: { type: String, default: '' },
+refundBkashNumber: { type: String, default: '' },
+  refundRequestedAt: { type: Date, default: null },
+  refundAdminNote: { type: String, default: '' },
+  refundProcessedAt: { type: Date, default: null },
   isActive: { type: Boolean, default: true },
   // Email notification tracking
   emailSent: {

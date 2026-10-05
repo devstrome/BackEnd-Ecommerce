@@ -16,6 +16,16 @@ module.exports.setSocketIO = (io) => {
   ioInstance = io;
 };
 
+// Look up an order by its human-readable orderId OR its Mongo _id
+// (the admin UI sometimes passes _id, the user UI passes orderId)
+const findOrderByRefundKey = async (key, session) => {
+  const query = mongoose.isValidObjectId(key)
+    ? Order.findOne({ $or: [{ orderId: key }, { _id: key }] })
+    : Order.findOne({ orderId: key });
+  if (session) return query.session(session);
+  return query;
+};
+
 // Helper function to emit inventory assignment events
 function emitInventoryAssignment(productId, variantId, size, action, data = {}) {
   if (!ioInstance) {
@@ -82,6 +92,7 @@ function notifyOrderUpdate(order, eventType) {
       userId: order.userId,
       orderStatus: order.orderStatus,
       paymentStatus: order.paymentStatus,
+      refundStatus: order.refundStatus,
       totalAmount: order.totalAmount,
       createdAt: order.createdAt,
       updatedAt: order.updatedAt
@@ -154,6 +165,7 @@ module.exports.getAllOrders = async (req, res) => {
       from,
       to,
       isActive,
+      refundStatus,
     } = req.query;
 
     const pageNum = Math.max(parseInt(page, 10) || 1, 1);
@@ -196,6 +208,12 @@ module.exports.getAllOrders = async (req, res) => {
     if (typeof isActive === 'string') {
       if (isActive.toLowerCase() === 'true') filter.isActive = true;
       if (isActive.toLowerCase() === 'false') filter.isActive = false;
+    }
+
+    // Refund request status filter
+    if (refundStatus) {
+      const rStatuses = refundStatus.split(',').map(s => s.trim()).filter(Boolean);
+      if (rStatuses.length) filter.refundStatus = { $in: rStatuses };
     }
 
     // Date range
@@ -243,6 +261,7 @@ module.exports.getAllOrders = async (req, res) => {
           userId: filter.userId?.toString?.() || undefined,
           status: filter.orderStatus?.$in,
           paymentStatus: filter.paymentStatus?.$in,
+          refundStatus: filter.refundStatus?.$in,
           orderId: filter.orderId,
           isActive: filter.isActive,
           from: from || undefined,
@@ -363,6 +382,24 @@ module.exports.createOrder = async (req, res) => {
       estimatedDays: shippingMethod.estimatedDays,
     };
 
+    // Apply admin-configured checkout rules (min/max order, COD limits, delivery multiplier, fees...)
+    const { evaluateCheckoutRules } = require('../utils/checkoutRuleEngine');
+    const ruleEval = await evaluateCheckoutRules({
+      subtotal: Number(totalAmount),
+      discountAmount: Number(discountAmount || 0),
+      shippingCharge: orderShipping.charge,
+      paymentMethod: normalizedPaymentMethod,
+      items: items.map(i => ({ name: i.name, quantity: Number(i.quantity) || 0 })),
+    });
+
+    if (!ruleEval.ok) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        message: ruleEval.blockers.map(b => b.message).join(' '),
+        blockers: ruleEval.blockers,
+      });
+    }
+
     // 🔹 Update order items without automatic inventory assignment
     const itemsWithInventory = items.map((item) => {
       return {
@@ -383,8 +420,11 @@ module.exports.createOrder = async (req, res) => {
       couponCode,
       shippingAddress,
       shipping: orderShipping,
-      shippingCost: orderShipping.charge,
-      grandTotal: totalAmount - discountAmount + orderShipping.charge, // subtotal - discount + shipping
+      shippingCost: ruleEval.deliveryCharge,
+      extraFees: ruleEval.extraFees,
+      extraFeeTotal: ruleEval.extraFeeTotal,
+      checkoutRulesApplied: ruleEval.appliedRules,
+      grandTotal: ruleEval.grandTotal, // subtotal - discount + delivery + fees
       paymentMethod: normalizedPaymentMethod,
       selectedPaymentMethod,
       paymentDetails,
@@ -428,6 +468,177 @@ module.exports.createOrder = async (req, res) => {
     return res.status(500).json({ message: err.message || 'Server error' });
   } finally {
     session.endSession();
+  }
+};
+
+// 🛡️ Admin: manually create an order for a customer (with full totals computed server-side)
+module.exports.adminCreateOrder = async (req, res) => {
+  try {
+    const {
+      userId,
+      email,
+      items,
+      shippingAddress,
+      shipping,
+      paymentMethod,
+      selectedPaymentMethodId,
+      paymentDetails,
+      discountAmount = 0,
+      couponCode = null,
+      orderStatus = 'pending',
+      paymentStatus = 'pending',
+    } = req.body;
+
+    if (!userId || !items || !Array.isArray(items) || items.length === 0 ||
+      !shippingAddress || !paymentMethod || !shipping || !shipping.name) {
+      return res.status(400).json({ message: 'Missing required fields (user, items, address, shipping method, payment)' });
+    }
+
+    // Validate shipping address
+    const requiredShippingFields = ['fullName', 'address', 'city', 'postalCode', 'country', 'phone'];
+    for (const field of requiredShippingFields) {
+      if (!shippingAddress[field]?.trim()) {
+        return res.status(400).json({ message: `Shipping address '${field}' is required` });
+      }
+    }
+
+    // Validate items and compute subtotal server-side
+    for (const item of items) {
+      if (!item.variantId || !item.productId || !item.name ||
+        typeof item.discountApplied !== 'number' ||
+        !item.quantity || !item.price || !item.mainImage ||
+        !item.measureType || !item.unitName) {
+        return res.status(400).json({ message: 'Each item must include required fields (variant, product, name, quantity, price, image, measure)' });
+      }
+    }
+    const subtotal = items.reduce((sum, it) => sum + Number(it.price) * Number(it.quantity), 0);
+
+    // User must exist
+    const user = await User.findById(userId).lean();
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    // Confirmation email destination: admin-entered email wins, fallback to the user's account email
+    const recipientEmail = String(email || user.email || '').trim();
+    if (!recipientEmail || !/^\S+@\S+\.\S+$/.test(recipientEmail)) {
+      return res.status(400).json({ message: 'A valid customer email address is required' });
+    }
+
+    // Payment resolution (COD or a saved wallet method of that user)
+    const pmLower = String(paymentMethod).toLowerCase();
+    const isCod = pmLower === 'cash on delivery' || pmLower === 'cash';
+    let normalizedPaymentMethod;
+    let selectedPaymentMethod;
+
+    if (isCod) {
+      normalizedPaymentMethod = 'Cash on Delivery';
+      selectedPaymentMethod = { methodId: 'cash', type: 'Cash on Delivery', label: 'Cash on Delivery' };
+    } else {
+      const method = (user.paymentMethods || []).find(
+        m => m._id.toString() === selectedPaymentMethodId
+      );
+      if (!method) {
+        // Admin may record a manual wallet payment not saved on the user's profile
+        if (!['bkash', 'nagad', 'bKash', 'Nagad'].includes(paymentMethod)) {
+          return res.status(400).json({ message: 'Select a valid payment method for this user' });
+        }
+        selectedPaymentMethod = { methodId: 'admin-manual', type: paymentMethod, label: paymentMethod };
+      } else {
+        selectedPaymentMethod = {
+          methodId: method._id,
+          type: method.type,
+          label: method.label || `${method.type} ${method.walletNumberMasked || ''}`,
+        };
+      }
+      normalizedPaymentMethod = paymentMethod;
+    }
+
+    // Shipping method must be active in DB; charge comes from DB
+    const Shipping = require('../models/Shipping');
+    const shippingMethod = await Shipping.findOne({ name: shipping.name, isActive: true });
+    if (!shippingMethod) {
+      return res.status(400).json({ message: 'Selected shipping method is not available' });
+    }
+
+    // Apply checkout rules for delivery/fee math (admin override: blockers become warnings)
+    const { evaluateCheckoutRules } = require('../utils/checkoutRuleEngine');
+    const ruleEval = await evaluateCheckoutRules({
+      subtotal,
+      discountAmount: Number(discountAmount) || 0,
+      shippingCharge: shippingMethod.charge,
+      paymentMethod: normalizedPaymentMethod,
+      items: items.map(i => ({ name: i.name, quantity: Number(i.quantity) || 0 })),
+    });
+
+    // Validate status values against model enums
+    const validOrderStatus = ['pending', 'processing', 'shipped', 'delivered', 'cancelled'];
+    const validPaymentStatus = ['pending', 'completed', 'failed', 'refunded'];
+    const finalOrderStatus = validOrderStatus.includes(orderStatus) ? orderStatus : 'pending';
+    const finalPaymentStatus = validPaymentStatus.includes(paymentStatus) ? paymentStatus : 'pending';
+
+    const itemsWithInventory = items.map((item) => ({
+      ...item,
+      assignedInventoryItems: [],
+      inventoryAssigned: false,
+    }));
+
+    const orderId = await generateOrderId();
+    const newOrder = new Order({
+      orderId,
+      userId,
+      items: itemsWithInventory,
+      totalAmount: subtotal,
+      discountAmount: Number(discountAmount) || 0,
+      couponCode,
+      shippingAddress,
+      shipping: {
+        name: shippingMethod.name,
+        charge: shippingMethod.charge,
+        estimatedDays: shippingMethod.estimatedDays,
+      },
+      shippingCost: ruleEval.deliveryCharge,
+      extraFees: ruleEval.extraFees,
+      extraFeeTotal: ruleEval.extraFeeTotal,
+      checkoutRulesApplied: ruleEval.appliedRules,
+      grandTotal: ruleEval.grandTotal,
+      paymentMethod: normalizedPaymentMethod,
+      selectedPaymentMethod,
+      paymentDetails: paymentDetails || {},
+      paymentStatus: finalPaymentStatus,
+      orderStatus: finalOrderStatus,
+      isActive: true,
+    });
+
+    const savedOrder = await newOrder.save();
+    notifyOrderUpdate(savedOrder, 'create');
+
+    // Send order confirmation email (never fail order creation if email fails)
+    let emailSent = false;
+    try {
+      const emailResult = await sendOrderConfirmation(savedOrder, {
+        fullName: shippingAddress.fullName,
+        email: recipientEmail,
+      });
+      emailSent = !!emailResult.success;
+      if (emailSent) {
+        await Order.updateOne({ _id: savedOrder._id }, { $set: { emailSent: 'confirmation' } });
+        savedOrder.emailSent = 'confirmation';
+        console.log(`✅ Admin order confirmation email sent for #${savedOrder.orderId} → ${recipientEmail}`);
+      } else {
+        console.warn(`⚠️ Failed to send admin order confirmation email for #${savedOrder.orderId}: ${emailResult.message || emailResult.error}`);
+      }
+    } catch (emailError) {
+      console.error(`⚠️ Error sending admin order confirmation email for #${savedOrder.orderId}:`, emailError.message);
+    }
+
+    return res.status(201).json({
+      order: savedOrder,
+      orderId: savedOrder.orderId,
+      emailSent,
+      warnings: ruleEval.blockers, // checkout rules the admin overrode
+    });
+  } catch (err) {
+    console.error('Admin Create Order Error:', err);
+    return res.status(500).json({ message: err.message || 'Server error' });
   }
 };
 
@@ -783,7 +994,7 @@ module.exports.refundOrder = async (req, res) => {
       return res.status(400).json({ message: 'Order ID is required' });
     }
 
-    const order = await Order.findOne({ orderId }).session(session);
+    const order = await findOrderByRefundKey(orderId, session);
     if (!order) {
       await session.abortTransaction();
       return res.status(404).json({ message: 'Order not found' });
@@ -816,6 +1027,13 @@ module.exports.refundOrder = async (req, res) => {
     order.orderStatus = 'cancelled';
     order.isActive = false;
 
+    // Sync pending refund request (admin refunded directly while a request was open)
+    if (order.refundStatus === 'pending') {
+      order.refundStatus = 'approved';
+      order.refundAdminNote = order.refundAdminNote || refundReason;
+      order.refundProcessedAt = new Date();
+    }
+
     const updatedOrder = await order.save({ session });
     await session.commitTransaction();
 
@@ -840,6 +1058,130 @@ module.exports.refundOrder = async (req, res) => {
     });
   } finally {
     session.endSession();
+  }
+};
+
+// User: request a refund for their own order
+module.exports.requestRefund = async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { reason = '', note = '', refundImage = '', bkashNumber = '' } = req.body;
+
+    if (!orderId) return res.status(400).json({ message: 'Order ID is required' });
+
+    const order = await findOrderByRefundKey(orderId);
+    if (!order) return res.status(404).json({ message: 'Order not found' });
+
+    if (String(order.userId) !== String(req.user._id)) {
+      return res.status(403).json({ message: 'You can only request a refund for your own orders' });
+    }
+
+    if (order.paymentStatus === 'refunded') {
+      return res.status(400).json({ message: 'Order is already refunded' });
+    }
+    if (order.refundStatus === 'pending') {
+      return res.status(400).json({ message: 'A refund request is already pending for this order' });
+    }
+    if (order.refundStatus === 'approved') {
+      return res.status(400).json({ message: 'Refund has already been approved for this order' });
+    }
+
+    const trimmedReason = String(reason || '').trim();
+    if (!trimmedReason) {
+      return res.status(400).json({ message: 'Please provide a reason for the refund request' });
+    }
+    const trimmedBkash = String(bkashNumber || '').trim();
+    if (!trimmedBkash) {
+      return res.status(400).json({ message: 'bKash number is required to receive the refund amount' });
+    }
+
+    order.refundStatus = 'pending';
+    order.refundReason = trimmedReason;
+    order.refundNote = String(note || '').trim();
+    order.refundImage = String(refundImage || '').trim();
+    order.refundBkashNumber = trimmedBkash;
+    order.refundRequestedAt = new Date();
+    order.refundAdminNote = '';
+    order.refundProcessedAt = null;
+
+    const updatedOrder = await order.save();
+
+    // Sync: notify the admin panel and the user's open pages
+    notifyOrderUpdate(updatedOrder, 'update');
+
+    return res.json({
+      success: true,
+      message: 'Refund request submitted. We will review it shortly.',
+      order: updatedOrder,
+    });
+  } catch (err) {
+    console.error('Request Refund Error:', err);
+    return res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// Admin: approve or reject a user's refund request
+module.exports.processRefundRequest = async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { action, adminNote = '' } = req.body;
+
+    if (!orderId) return res.status(400).json({ message: 'Order ID is required' });
+    if (!['approve', 'reject'].includes(action)) {
+      return res.status(400).json({ message: "Action must be 'approve' or 'reject'" });
+    }
+    if (action === 'reject' && !String(adminNote || '').trim()) {
+      return res.status(400).json({ message: 'Admin note is required when rejecting a refund request' });
+    }
+
+    const order = await findOrderByRefundKey(orderId);
+    if (!order) return res.status(404).json({ message: 'Order not found' });
+
+    if (order.refundStatus !== 'pending') {
+      return res.status(400).json({ message: 'No pending refund request found for this order' });
+    }
+
+    order.refundAdminNote = String(adminNote || '').trim();
+    order.refundProcessedAt = new Date();
+
+    if (action === 'reject') {
+      order.refundStatus = 'rejected';
+      const updatedOrder = await order.save();
+      notifyOrderUpdate(updatedOrder, 'update');
+      return res.json({
+        success: true,
+        message: 'Refund request rejected',
+        order: updatedOrder,
+      });
+    }
+
+    // Approve: release inventory and mark the money as refunded (when paid)
+    if (order.items && order.items.length > 0) {
+      const inventoryRelease = await releaseInventoryFromOrder(order.items, 'payment_refunded');
+      if (!inventoryRelease.success) {
+        console.error('Failed to release inventory on refund approval:', inventoryRelease.errors);
+        // Continue with the refund even if inventory release fails
+      }
+    }
+
+    if (order.paymentStatus === 'completed') {
+      order.paymentStatus = 'refunded';
+    }
+    order.refundStatus = 'approved';
+    order.orderStatus = 'cancelled';
+    order.isActive = false;
+
+    const updatedOrder = await order.save();
+    notifyOrderUpdate(updatedOrder, 'update');
+
+    return res.json({
+      success: true,
+      message: 'Refund approved successfully',
+      order: updatedOrder,
+    });
+  } catch (err) {
+    console.error('Process Refund Request Error:', err);
+    return res.status(500).json({ message: 'Server error' });
   }
 };
 

@@ -60,4 +60,47 @@ router.get('/admin/wishlists', authenticateAdmin, async (req, res) => {
   }
 });
 
+// ✉️ Admin: send a wishlist-related email to a customer via the server email account
+router.post('/admin/wishlists/send-email', authenticateAdmin, async (req, res) => {
+  try {
+    const to = (req.body.to || '').trim();
+    const subject = (req.body.subject || '').trim();
+    const message = (req.body.message || '').trim();
+
+    if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) {
+      return res.status(400).json({ message: 'A valid recipient email is required' });
+    }
+    if (!subject) return res.status(400).json({ message: 'Subject is required' });
+    if (!message) return res.status(400).json({ message: 'Message is required' });
+    if (subject.length > 200) return res.status(400).json({ message: 'Subject cannot exceed 200 characters' });
+    if (message.length > 5000) return res.status(400).json({ message: 'Message cannot exceed 5000 characters' });
+
+    const { sendCustomEmail } = require('../utils/emailService');
+    const escapeHtml = (s = '') => String(s).replace(/[&<>"']/g, (c) => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    ));
+    const html = `
+      <div style="font-family: Arial, Helvetica, sans-serif; max-width: 600px; margin: 0 auto; color: #1B1B1B;">
+        <div style="background: #B1123B; padding: 24px; text-align: center; color: #fff; border-radius: 8px 8px 0 0;">
+          <h1 style="margin: 0; font-size: 22px; letter-spacing: 3px;">BELORELLA</h1>
+        </div>
+        <div style="border: 1px solid #eee; border-top: none; padding: 24px; border-radius: 0 0 8px 8px;">
+          <div style="line-height: 1.6;">${escapeHtml(message).replace(/\n/g, '<br/>')}</div>
+        </div>
+        <p style="font-size: 12px; color: #888; text-align: center; margin-top: 16px;">
+          &copy; ${new Date().getFullYear()} Belorella. All rights reserved.
+        </p>
+      </div>
+    `;
+
+    const result = await sendCustomEmail({ to, subject, html, text: message });
+    if (!result.success) {
+      return res.status(502).json({ message: result.message || result.error || 'Failed to send email' });
+    }
+    res.json({ message: 'Email sent successfully' });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to send email', error: err.message });
+  }
+});
+
 module.exports = router;
