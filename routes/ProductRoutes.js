@@ -18,7 +18,8 @@ const {
   toggleWishlist,
   getWishlist,
   purchaseBroadcast,
-  generateSKUs
+  generateSKUs,
+  getTopRatedProducts
 } = require('../controller/productController');
 
 
@@ -42,6 +43,8 @@ router.post(
 
 
 router.get('/products',  getProducts);
+// must be declared before '/products/:id'
+router.get('/products/top-rated', getTopRatedProducts);
 router.post('/products/generate-skus', authenticateAdmin, generateSKUs);
 router.get('/products/:id',  getSingleProduct);
 // Reviews

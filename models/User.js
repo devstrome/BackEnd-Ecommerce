@@ -56,12 +56,16 @@ const userSchema = new mongoose.Schema({
   },
   phoneNumber: {
     type: String,
-    required: true,
+    required: false, // optional for Google-only accounts (validated in controllers for password signup)
     trim: true,
     match: [/^\+8801[3-9]\d{8}$/, 'Please enter a valid Bangladeshi phone number'],
   },
   userName: { type: String, required: true, unique: true, trim: true },
   password: { type: String, required: true, minlength: 6 },
+  googleId: { type: String, index: true, sparse: true },
+  provider: { type: String, enum: ['local', 'google'], default: 'local' },
+  // Google sign-ups get a random password until the user chooses their own
+  mustSetPassword: { type: Boolean, default: false },
   imageUrl: { type: String, required: true },
   isEmailVerified: { type: Boolean, default: false },
   wishlist: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }],
@@ -81,6 +85,13 @@ const userSchema = new mongoose.Schema({
   },
 
   paymentMethods: [PaymentMethodBaseSchema],
+
+  // Last-known device/network identity (used by the ban system)
+  lastLoginIp: { type: String },
+  lastDeviceId: { type: String },
+  lastFingerprint: { type: String },
+  lastNetwork: { type: String },
+  banned: { type: Boolean, default: false },
 }, { timestamps: true });
 
 // 👨‍🔧 Attach embedded discriminators

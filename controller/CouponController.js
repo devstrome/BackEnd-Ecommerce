@@ -1,5 +1,7 @@
 const Coupon = require("../models/Coupon");
 const Product = require("../models/Product");
+const { emitStoreEvent } = require("../utils/storeEvents");
+const { revalidateCarts } = require("./CartController");
 
 // Create a new coupon
 exports.createCoupon = async (req, res) => {
@@ -50,6 +52,10 @@ exports.createCoupon = async (req, res) => {
 
     // Save the coupon to the database
     await coupon.save();
+
+    // Push the new coupon to every open client so admin + storefront lists
+    // refresh immediately.
+    emitStoreEvent("coupon_created", { coupon });
 
     res.status(201).json({ message: "Coupon created successfully", coupon });
   } catch (error) {
@@ -122,6 +128,10 @@ exports.updateCoupon = async (req, res) => {
       return res.status(404).json({ message: "Coupon not found" });
     }
 
+    emitStoreEvent("coupon_updated", { coupon });
+    // Re-validate every cart currently holding this coupon
+    revalidateCarts({ couponId: coupon._id }).catch(() => {});
+
     res.status(200).json({ message: "Coupon updated successfully", coupon });
   } catch (error) {
     res.status(500).json({ message: "Error updating coupon", error: error.message });
@@ -135,6 +145,9 @@ exports.deleteCoupon = async (req, res) => {
     if (!coupon) {
       return res.status(404).json({ message: "Coupon not found" });
     }
+    emitStoreEvent("coupon_deleted", { couponId: req.params.id, code: coupon.code });
+    // Carts pointing at the deleted coupon must drop it
+    revalidateCarts({ couponId: coupon._id }).catch(() => {});
     res.status(200).json({ message: "Coupon deleted successfully" });
   } catch (error) {
     res.status(500).json({ message: "Error deleting coupon", error: error.message });

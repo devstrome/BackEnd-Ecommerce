@@ -31,12 +31,12 @@ async function generateSEO(product, { force = true } = {}) {
     })
     .join('\n');
 
-  const prompt = `You are Belorella's head of SEO. Generate SEO metadata for the following product. You have FULL creative control — craft compelling, click-worthy meta that will rank high on Google and convert shoppers.
+  const prompt = `You are BELORELLA's head of SEO. Generate SEO metadata for the following product. You have FULL creative control — craft compelling, click-worthy meta that will rank high on Google and convert shoppers.
 
 Return ONLY a valid JSON object with these exact keys:
-- metaTitle: A compelling product title (max 70 chars, include brand and key feature, end with "| Belorella")
+- metaTitle: A compelling product title (max 70 chars, include brand and key feature, end with "| BELORELLA")
 - metaDescription: A persuasive product description (max 170 chars, include price, benefit, and call-to-action)
-- metaKeywords: A comma-separated list of 12-20 relevant keywords (include product name, brand, category, variant colors/sizes, use cases, and "Belorella", "Bangladesh", "buy online")
+- metaKeywords: A comma-separated list of 12-20 relevant keywords (include product name, brand, category, variant colors/sizes, use cases, and "BELORELLA", "Bangladesh", "buy online")
 
 Product data:
 - Name: ${name}
@@ -50,7 +50,7 @@ Product data:
 ${variantLines || 'N/A'}
 
 Example output format:
-{"metaTitle":"Nike Air Max 270 — BDT 12,500 | Belorella","metaDescription":"Shop Nike Air Max 270 at BDT 12,500. Comfortable, stylish sneakers with air cushioning. Fast delivery across Bangladesh. Order now!","metaKeywords":"nike air max 270, nike shoes, air max, buy nike Bangladesh, ..."}
+{"metaTitle":"Nike Air Max 270 — BDT 12,500 | BELORELLA","metaDescription":"Shop Nike Air Max 270 at BDT 12,500. Comfortable, stylish sneakers with air cushioning. Fast delivery across Bangladesh. Order now!","metaKeywords":"nike air max 270, nike shoes, air max, buy nike Bangladesh, ..."}
 
 Rules:
 - metaTitle must be ≤70 characters
@@ -58,7 +58,7 @@ Rules:
 - Be creative and persuasive — this is marketing copy, not a data sheet
 - Include price and brand where relevant
 - Cover ALL variants — mention available colors/sizes so the meta appeals to every variant shopper
-- End metaTitle with "| Belorella"`;
+- End metaTitle with "| BELORELLA"`;
 
   try {
     const res = await axios.post(
@@ -97,14 +97,14 @@ Rules:
 
 // ─── Emergency fallback (only when AI is unavailable) ───────
 function fallbackMetaTitle(p) {
-  return `${p.brand ? p.brand + ' ' : ''}${p.name}${p.discountPrice || p.mainPrice ? ' — BDT' + (p.discountPrice || p.mainPrice) : ''} | Belorella`.slice(0, 70);
+  return `${p.brand ? p.brand + ' ' : ''}${p.name}${p.discountPrice || p.mainPrice ? ' — BDT' + (p.discountPrice || p.mainPrice) : ''} | BELORELLA`.slice(0, 70);
 }
 function fallbackMetaDescription(p) {
   const price = p.discountPrice || p.mainPrice;
-  return `Shop ${p.brand ? p.brand + ' ' : ''}${p.name}${price ? ' at BDT' + price : ''}. ✓ Authentic ✓ Fast delivery ✓ Easy returns. Order from Belorella now!`.slice(0, 170);
+  return `Shop ${p.brand ? p.brand + ' ' : ''}${p.name}${price ? ' at BDT' + price : ''}. ✓ Authentic ✓ Fast delivery ✓ Easy returns. Order from BELORELLA now!`.slice(0, 170);
 }
 function fallbackMetaKeywords(p) {
-  const parts = [p.name, p.brand, ...(Array.isArray(p.categories) ? p.categories.flat().filter(Boolean) : []), p.gender, 'Belorella', 'buy online', 'Bangladesh'].filter(Boolean);
+  const parts = [p.name, p.brand, ...(Array.isArray(p.categories) ? p.categories.flat().filter(Boolean) : []), p.gender, 'BELORELLA', 'buy online', 'Bangladesh'].filter(Boolean);
   return [...new Set(parts.map(s => String(s).toLowerCase().trim()))].join(', ');
 }
 async function fallbackSEO(product, force = true) {
@@ -132,9 +132,9 @@ function variantPriceStr(v) {
 
 function fallbackVariantSEO(product, variant) {
   const price = variantPriceStr(variant);
-  const title = `${product.brand ? product.brand + ' ' : ''}${product.name}${variant.colorName ? ' — ' + variant.colorName : ''} | Belorella`.slice(0, 70);
+  const title = `${product.brand ? product.brand + ' ' : ''}${product.name}${variant.colorName ? ' — ' + variant.colorName : ''} | BELORELLA`.slice(0, 70);
   const desc = `Shop ${product.name}${variant.colorName ? ` (${variant.colorName})` : ''}${price ? ` at ${price}` : ''}. ${Array.isArray(variant.sizes) && variant.sizes.length ? `Sizes: ${variant.sizes.join(', ')}. ` : ''}Fast delivery across Bangladesh.`.slice(0, 170);
-  const parts = [product.name, variant.colorName, product.brand, ...(Array.isArray(product.categories) ? product.categories.flat() : []), ...(Array.isArray(variant.sizes) ? variant.sizes : []), product.gender, 'Belorella', 'buy online', 'Bangladesh'].filter(Boolean);
+  const parts = [product.name, variant.colorName, product.brand, ...(Array.isArray(product.categories) ? product.categories.flat() : []), ...(Array.isArray(variant.sizes) ? variant.sizes : []), product.gender, 'BELORELLA', 'buy online', 'Bangladesh'].filter(Boolean);
   return {
     metaTitle: title,
     metaDescription: desc,
@@ -150,19 +150,19 @@ async function aiVariantSEO(product, targets) {
   if (!apiKey) return null;
 
   const catStr = Array.isArray(product.categories) ? product.categories.join(', ') : 'N/A';
-  const prompt = `You are Belorella's head of SEO. Generate SEO metadata for EACH variant of the product below.
+  const prompt = `You are BELORELLA's head of SEO. Generate SEO metadata for EACH variant of the product below.
 
 Return ONLY a valid JSON array with exactly ${targets.length} object(s), in the same order as the variants, each with these exact keys:
-- metaTitle (max 70 chars, includes the variant color, ends with "| Belorella")
+- metaTitle (max 70 chars, includes the variant color, ends with "| BELORELLA")
 - metaDescription (max 170 chars, includes color, price/size info, call-to-action)
-- metaKeywords (comma-separated, 8-15 keywords including color name, product, "Belorella", "Bangladesh")
+- metaKeywords (comma-separated, 8-15 keywords including color name, product, "BELORELLA", "Bangladesh")
 
 Product: ${product.name}${product.brand ? ` by ${product.brand}` : ''} (${catStr}) — BDT ${product.discountPrice || product.mainPrice || 'N/A'} — ${product.gender || 'Unisex'}
 
 Variants:
 ${targets.map(({ v }, k) => `${k}. Color: ${v.colorName || 'N/A'} | sizes: ${(Array.isArray(v.sizes) ? v.sizes.join(', ') : '') || 'N/A'} | prices: BDT ${(Array.isArray(v.prices) ? v.prices.join('/') : '') || 'N/A'} | sale: BDT ${(Array.isArray(v.discountPrices) ? v.discountPrices.filter(x => x > 0).join('/') : '') || 'none'} | badges: ${(Array.isArray(v.badgeNames) ? v.badgeNames.join(', ') : '') || 'N/A'} | description: ${(v.description || '').replace(/\s+/g, ' ').slice(0, 180) || 'N/A'}`).join('\n')}
 
-Example: [{"metaTitle":"Creme Allure Lipstick — Nude | Belorella","metaDescription":"...","metaKeywords":"nude lipstick, ..."}]
+Example: [{"metaTitle":"Creme Allure Lipstick — Nude | BELORELLA","metaDescription":"...","metaKeywords":"nude lipstick, ..."}]
 
 Rules: metaTitle ≤70 chars, metaDescription ≤170 chars, each must be unique per color, persuasive marketing copy.`;
 

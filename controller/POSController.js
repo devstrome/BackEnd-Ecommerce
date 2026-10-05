@@ -4,6 +4,7 @@ const Product = require('../models/Product');
 const catchAsyncErrors = require('../middleware/catchAsyncErrors');
 const ErrorHandler = require('../utils/errorHandler');
 const { sendPOSReceipt } = require('../utils/emailService');
+const { enrichInventoryItem } = require('./InventoryController');
 
 // Generate unique POS order number
 async function generatePOSOrderNumber() {
@@ -45,15 +46,47 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
   } = req.body;
 
   // Validate items and check inventory
+  if (!Array.isArray(items) || items.length === 0) {
+    return next(new ErrorHandler('Order must contain at least one item', 400));
+  }
+
+  const seenInventoryIds = new Set();
+  const normalizedItems = [];
+
   for (const item of items) {
+    const qty = Math.max(1, Number(item.quantity) || 1);
+
+    if (seenInventoryIds.has(String(item.inventoryId))) {
+      return next(new ErrorHandler('Duplicate inventory item in cart: same unit scanned twice', 400));
+    }
+    seenInventoryIds.add(String(item.inventoryId));
+
     const inventory = await Inventory.findById(item.inventoryId);
     if (!inventory) {
       return next(new ErrorHandler(`Inventory item not found: ${item.inventoryId}`, 404));
     }
-    
-    if (inventory.availableQuantity < item.quantity) {
+
+    if (inventory.availableQuantity < qty) {
       return next(new ErrorHandler(`Insufficient stock for ${inventory.barcode}`, 400));
     }
+
+    normalizedItems.push({
+      inventoryId: item.inventoryId,
+      productId: item.productId,
+      productName: item.productName,
+      variantInfo: {
+        size: item.variantInfo?.size ?? item.size,
+        color: item.variantInfo?.color ?? item.color,
+        barcode: item.variantInfo?.barcode ?? item.barcode,
+        measureType: item.measureType ?? item.variantInfo?.measureType,
+        unitName: item.unitName ?? item.variantInfo?.unitName
+      },
+      quantity: qty,
+      unitPrice: item.unitPrice,
+      discountPrice: item.discountPrice,
+      totalPrice: item.totalPrice,
+      scannedBarcode: item.scannedBarcode
+    });
   }
 
   // Generate unique order number
@@ -62,7 +95,7 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
   const posOrder = await POSOrder.create({
     orderNumber,
     customer,
-    items,
+    items: normalizedItems,
     subtotal,
     tax,
     discount,
@@ -75,17 +108,21 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
     notes
   });
 
-  // Update inventory - assign items (set assignedQuantity to 1, availableQuantity to 0, status to out_of_stock)
-  for (const item of items) {
-    await Inventory.findByIdAndUpdate(
-      item.inventoryId,
+  // Update inventory — quantity-aware (pipeline update survives findByIdAndUpdate
+  // bypassing the schema pre-save hook; status mirrors the same rule as the hook)
+  for (const item of normalizedItems) {
+    await Inventory.findByIdAndUpdate(item.inventoryId, [
       {
-        assignedQuantity: 1,
-        availableQuantity: 0,
-        status: 'out_of_stock',
-        lastUpdated: new Date()
+        $set: {
+          assignedQuantity: item.quantity,
+          availableQuantity: { $max: [0, { $subtract: ['$stockQuantity', item.quantity] }] },
+          status: {
+            $cond: [{ $lte: [{ $subtract: ['$stockQuantity', item.quantity] }, 0] }, 'out_of_stock', 'active']
+          },
+          lastUpdated: new Date()
+        }
       }
-    );
+    ]);
   }
 
   // Broadcast live purchase via socket
@@ -123,12 +160,20 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
 
 // Get all POS orders
 exports.getAllPOSOrders = catchAsyncErrors(async (req, res, next) => {
-  const { page = 1, limit = 10, status, outlet, dateFrom, dateTo } = req.query;
+  const { page = 1, limit = 10, status, outlet, dateFrom, dateTo, search } = req.query;
   
   const query = {};
   
   if (status) query.orderStatus = status;
   if (outlet) query.outlet = outlet;
+  if (search) {
+    const rx = { $regex: String(search).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
+    query.$or = [
+      { orderNumber: rx },
+      { 'customer.name': rx },
+      { 'customer.phone': rx }
+    ];
+  }
   if (dateFrom || dateTo) {
     query.createdAt = {};
     if (dateFrom) query.createdAt.$gte = new Date(dateFrom);
@@ -191,13 +236,31 @@ exports.updatePOSOrderStatus = catchAsyncErrors(async (req, res, next) => {
   });
 });
 
-// Scan barcode and get product info
+// Scan barcode and get product info (barcode → qrCode → product SKU)
 exports.scanBarcode = catchAsyncErrors(async (req, res, next) => {
   const { barcode } = req.body;
+  if (!barcode) {
+    return next(new ErrorHandler('Barcode is required', 400));
+  }
 
-  const inventory = await Inventory.findOne({ barcode })
-    .populate('productId', 'name images description')
-    .populate('variantId');
+  const code = String(barcode).trim();
+  const PROJ = 'name mainImage mainPrice variants sku';
+  let inventory = await Inventory.findOne({ barcode: code })
+    .populate('productId', PROJ);
+
+  if (!inventory) {
+    inventory = await Inventory.findOne({ qrCode: code })
+      .populate('productId', PROJ);
+  }
+
+  if (!inventory) {
+    // Product-level SKU: sell first available unit of that product
+    const product = await Product.findOne({ sku: { $regex: `^${code}$`, $options: 'i' } }).select('_id');
+    if (product) {
+      inventory = await Inventory.findOne({ productId: product._id, availableQuantity: { $gt: 0 } })
+        .populate('productId', PROJ);
+    }
+  }
 
   if (!inventory) {
     return next(new ErrorHandler('Product not found with this barcode', 404));
@@ -209,27 +272,35 @@ exports.scanBarcode = catchAsyncErrors(async (req, res, next) => {
 
   res.status(200).json({
     success: true,
-    inventory
+    inventory: enrichInventoryItem(inventory.toObject())
   });
 });
 
-// Search products by name or barcode
+// Search products by name, SKU, barcode or qr code
 exports.searchProducts = catchAsyncErrors(async (req, res, next) => {
   const { query } = req.query;
+  if (!query) {
+    return res.status(200).json({ success: true, inventory: [] });
+  }
+
+  const rx = { $regex: String(query).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
+
+  // Product name / SKU matches → their available inventory units
+  const products = await Product.find({ $or: [{ name: rx }, { sku: rx }] }).select('_id').limit(50);
 
   const inventory = await Inventory.find({
     $or: [
-      { barcode: { $regex: query, $options: 'i' } },
-      { qrCode: { $regex: query, $options: 'i' } }
+      { barcode: rx },
+      { qrCode: rx },
+      ...(products.length ? [{ productId: { $in: products.map(p => p._id) } }] : [])
     ]
   })
-  .populate('productId', 'name images description')
-  .populate('variantId')
+  .populate('productId', 'name mainImage mainPrice variants sku')
   .limit(10);
 
   res.status(200).json({
     success: true,
-    inventory
+    inventory: inventory.map(item => enrichInventoryItem(item.toObject()))
   });
 });
 
@@ -325,17 +396,18 @@ exports.refundPOSOrder = catchAsyncErrors(async (req, res, next) => {
   posOrder.paymentStatus = 'refunded';
   posOrder.notes = `${posOrder.notes || ''}\nRefund: ${refundAmount} - ${reason}`;
 
-  // Restore inventory items to active status (set assignedQuantity to 0, availableQuantity to 1, status to active)
+  // Restore inventory items to active status (return assigned stock to available)
   for (const item of posOrder.items) {
-    await Inventory.findByIdAndUpdate(
-      item.inventoryId,
+    await Inventory.findByIdAndUpdate(item.inventoryId, [
       {
-        assignedQuantity: 0,
-        availableQuantity: 1,
-        status: 'active',
-        lastUpdated: new Date()
+        $set: {
+          assignedQuantity: 0,
+          availableQuantity: '$stockQuantity',
+          status: 'active',
+          lastUpdated: new Date()
+        }
       }
-    );
+    ]);
   }
 
   await posOrder.save();
@@ -355,15 +427,16 @@ exports.deletePOSOrder = catchAsyncErrors(async (req, res, next) => {
 
   // Restore inventory items to active status before deleting order
   for (const item of posOrder.items) {
-    await Inventory.findByIdAndUpdate(
-      item.inventoryId,
+    await Inventory.findByIdAndUpdate(item.inventoryId, [
       {
-        assignedQuantity: 0,
-        availableQuantity: 1,
-        status: 'active',
-        lastUpdated: new Date()
+        $set: {
+          assignedQuantity: 0,
+          availableQuantity: '$stockQuantity',
+          status: 'active',
+          lastUpdated: new Date()
+        }
       }
-    );
+    ]);
   }
 
   // Delete the POS order
@@ -372,5 +445,32 @@ exports.deletePOSOrder = catchAsyncErrors(async (req, res, next) => {
   res.status(200).json({
     success: true,
     message: 'POS Order deleted successfully'
+  });
+});
+
+// Email a copy of the receipt/invoice to the customer
+exports.sendPOSInvoiceEmail = catchAsyncErrors(async (req, res, next) => {
+  const posOrder = await POSOrder.findById(req.params.id)
+    .populate('cashier', 'firstName lastName')
+    .populate('items.productId', 'name')
+    .populate('items.inventoryId', 'barcode');
+
+  if (!posOrder) {
+    return next(new ErrorHandler('POS Order not found', 404));
+  }
+
+  if (!posOrder.customer?.email) {
+    return next(new ErrorHandler('This order has no customer email address', 400));
+  }
+
+  const result = await sendPOSReceipt(posOrder);
+  if (!result.success) {
+    return next(new ErrorHandler(result.message || result.error || 'Failed to send invoice email', 500));
+  }
+
+  res.status(200).json({
+    success: true,
+    message: `Invoice emailed to ${posOrder.customer.email}`,
+    messageId: result.messageId
   });
 });

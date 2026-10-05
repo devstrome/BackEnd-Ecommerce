@@ -32,6 +32,9 @@ const variantSchema = new Schema({
     charge: Number,
     estimatedDays: Number,
   }],
+  // References to the Shipping docs the options were built from (needed to
+  // restore selections when editing the product later)
+  shippingIds: [{ type: Schema.Types.ObjectId, ref: 'Shipping' }],
   // AI-generated SEO metadata for this specific variant
   seo: {
     metaTitle: { type: String, default: '' },

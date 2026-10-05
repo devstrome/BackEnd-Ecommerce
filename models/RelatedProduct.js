@@ -4,9 +4,11 @@ const { Schema } = mongoose;
 const relatedProductsSchema = new Schema({
     productId: {
         type: Schema.Types.ObjectId,
+        ref: 'Product',
         required: true
     },
     name: { type: String, required: true },
+    brand: { type: String, default: '' },
     mainPrice: { type: Number },
     discountPrice: { type: Number },
     mainBadgeName: { type: String },

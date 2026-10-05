@@ -507,7 +507,9 @@ exports.increaseQuantity = async (req, res) => {
 
     await cart.save();
 
-    const updatedCart = await Cart.findOne({ userId }).populate("items.productId");
+    const updatedCart = await Cart.findOne({ userId })
+      .populate("items.productId")
+      .populate("couponId");
 
     res.json({
       message: "Quantity increased",
@@ -580,7 +582,9 @@ exports.decreaseQuantity = async (req, res) => {
 
     await cart.save();
 
-    const updatedCart = await Cart.findOne({ userId }).populate("items.productId");
+    const updatedCart = await Cart.findOne({ userId })
+      .populate("items.productId")
+      .populate("couponId");
 
     res.json({
       message: "Quantity decreased",
@@ -653,7 +657,9 @@ exports.getCart = async (req, res) => {
   const { userId } = req.params;
 
   try {
-    const cart = await Cart.findOne({ userId }).populate('items.productId');
+    const cart = await Cart.findOne({ userId })
+      .populate('items.productId')
+      .populate('couponId');
     if (!cart) {
       return res.status(404).json({ message: 'Cart not found' });
     }
@@ -816,7 +822,9 @@ exports.applyCoupon = async (req, res) => {
     cart.discountAmount = totalDiscount;
 
     await cart.save();
-    cart = await Cart.findOne({ userId }).populate("items.productId");
+    cart = await Cart.findOne({ userId })
+      .populate("items.productId")
+      .populate("couponId");
 
     return res.status(200).json({
       success: true,
@@ -862,3 +870,88 @@ exports.deleteCart = async (req, res) => {
     res.status(500).json({ message: 'Error resetting cart', error: error.message });
   }
 };
+
+// -- Live sync helpers ----------------------------------------------------
+// Resolve the current catalog price for a cart line. Mirrors what ProductView
+// puts in the cart: the variant's discountPrice for that size, else the
+// product-level discountPrice, else mainPrice.
+function catalogPriceFor(product, item) {
+  if (!product) return null;
+  const variant =
+    (Array.isArray(product.variants) &&
+      product.variants.find(
+        (v) =>
+          String(v._id) === String(item.variantId || '') ||
+          normStr(v.colorName) === normStr(item.color)
+      )) ||
+    null;
+
+  const sizeIdx = variant && Array.isArray(variant.sizes)
+    ? variant.sizes.findIndex((s) => normStr(s) === normStr(item.size))
+    : -1;
+
+  const pick = (arr) =>
+    sizeIdx >= 0 && Array.isArray(arr) && Number.isFinite(Number(arr[sizeIdx])) && Number(arr[sizeIdx]) > 0
+      ? Number(arr[sizeIdx])
+      : null;
+
+  const price =
+    (variant && pick(variant.discountPrices)) ||
+    (variant && pick(variant.prices)) ||
+    (Number(product.discountPrice) > 0 ? Number(product.discountPrice) : null) ||
+    (Number(product.mainPrice) > 0 ? Number(product.mainPrice) : null);
+
+  return price && Number.isFinite(price) ? price : null;
+}
+
+// Re-price + re-validate carts affected by an admin change.
+//  - couponId    -> only carts currently holding that coupon
+//  - productIds  -> only carts containing those products (price sync)
+// Emits `cart:updated` to each affected user's room so the open cart /
+// checkout page refreshes without a reload.
+async function revalidateCarts({ couponId = null, productIds = null } = {}) {
+  const filter = {};
+  if (couponId) filter.couponId = couponId;
+  if (productIds && productIds.length) filter['items.productId'] = { $in: productIds };
+
+  const carts = await Cart.find(filter);
+  if (!carts.length) return [];
+
+  const { emitToUser, emitStoreEvent } = require('../utils/storeEvents');
+  const touched = [];
+
+  for (const cart of carts) {
+    try {
+      if (productIds && productIds.length) {
+        // Sync line prices to the current catalog price
+        const uniquePids = [...new Set(cart.items.map((i) => normId(i.productId)).filter(Boolean))];
+        const products = await Product.find({ _id: { $in: uniquePids } });
+        const byId = new Map(products.map((p) => [String(p._id), p]));
+        for (const item of cart.items) {
+          const p = byId.get(normId(item.productId));
+          const price = catalogPriceFor(p, item);
+          if (price != null && price !== Number(item.price)) item.price = price;
+        }
+      }
+
+      await recalcCartWithCoupon(cart);
+      await cart.save();
+      touched.push(cart.userId);
+    } catch (e) {
+      console.error('revalidateCarts failed for', cart.userId, e.message);
+    }
+  }
+
+  // Tell every affected user their cart changed
+  for (const userId of touched) {
+    emitToUser(userId, 'cart_updated', {}, 'cart:updated');
+  }
+  if (touched.length) {
+    emitStoreEvent('carts_revalidated', { count: touched.length }, 'storeChanged');
+  }
+
+  return touched;
+}
+
+exports.revalidateCarts = revalidateCarts;
+exports.catalogPriceFor = catalogPriceFor;

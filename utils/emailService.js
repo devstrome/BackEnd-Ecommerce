@@ -1,4 +1,5 @@
 const nodemailer = require('nodemailer');
+const { BRAND, brandFrom, brandFooter } = require('./brand');
 
 // Email configuration
 const transporter = nodemailer.createTransport({
@@ -29,52 +30,86 @@ const formatDate = (date) => {
   });
 };
 
+// Derives a friendly greeting name, falling back to fullName / email local part
+const greetName = (user, order) => {
+  const first = user?.firstName;
+  const last = user?.lastName;
+  if (first || last) return `${first || ''} ${last || ''}`.trim();
+  if (user?.fullName) return user.fullName;
+  const fallback = order?.shippingAddress?.fullName;
+  if (fallback) return fallback;
+  return '';
+};
+
+// Guarded address block (never throws on partial addresses)
+const addressLines = (order) => {
+  const a = order?.shippingAddress;
+  if (!a) return '<p style="margin: 5px 0; color: #666;">Address not provided</p>';
+  return `
+    <p style="margin: 5px 0;"><strong>${a.fullName || ''}</strong></p>
+    <p style="margin: 5px 0;">${a.address || ''}</p>
+    <p style="margin: 5px 0;">${[a.city, a.state, a.postalCode].filter(Boolean).join(', ')}</p>
+    ${a.country ? `<p style="margin: 5px 0;">${a.country}</p>` : ''}
+    ${a.phone ? `<p style="margin: 5px 0;"><strong>Phone:</strong> ${a.phone}</p>` : ''}
+  `;
+};
+
+// Extra fee rows (checkout rule surcharges) — empty string when none
+const extraFeeRows = (order, color = '#B1123B') => {
+  const fees = Array.isArray(order?.extraFees) ? order.extraFees.filter(f => f && f.amount > 0) : [];
+  if (!fees.length) return '';
+  return fees.map(f => `
+    <p style="margin: 5px 0;"><strong>${f.label || 'Extra Fee'}:</strong> ${formatCurrency(f.amount)}</p>
+  `).join('');
+};
+
 // Email templates
 const emailTemplates = {
   orderConfirmation: (order, user) => ({
     subject: `Order Confirmation - Order #${order.orderId}`,
     html: `
              <div style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
-         <div style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); padding: 20px; text-align: center; color: white;">
+         <div style="background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); padding: 20px; text-align: center; color: white;">
            <div style="display: flex; align-items: center; justify-content: center; gap: 15px; margin-bottom: 10px;">
-             <img src="https://barvella.com/Barvella.png" alt="Barvella Logo" style="width: 60px; height: 60px; object-fit: contain;">
-             <h1 style="margin: 0;">Barvella</h1>
+             <img src="${BRAND.LOGO_URL}" alt="${BRAND.NAME} Logo" style="width: 60px; height: 60px; object-fit: contain;">
+             <h1 style="margin: 0;">${BRAND.NAME}</h1>
            </div>
            <p style="margin: 5px 0;">Premium Fashion & Lifestyle</p>
          </div>
          
          <div style="padding: 20px; background: #f8f9fa;">
-           <h2 style="color: #d97706;">Order Confirmation</h2>
-          <p>Dear ${user?.firstName || ''} ${user?.lastName || ''},</p>
+           <h2 style="color: #B1123B;">Order Confirmation</h2>
+          <p>Dear ${greetName(user, order)},</p>
           <p>Thank you for your order! We're excited to confirm that your order has been received and is being processed.</p>
           
           <!-- Order Summary -->
-          <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #f59e0b;">
-            <h3 style="color: #d97706; margin-top: 0;">Order Summary</h3>
+          <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+            <h3 style="color: #B1123B; margin-top: 0;">Order Summary</h3>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
               <div>
                 <p><strong>Order ID:</strong> #${order.orderId}</p>
                 <p><strong>Order Date:</strong> ${formatDate(order.createdAt)}</p>
-                <p><strong>Order Status:</strong> <span style="color: #f59e0b; font-weight: bold; text-transform: uppercase;">${order.orderStatus}</span></p>
-                <p><strong>Payment Status:</strong> <span style="color: ${order.paymentStatus === 'completed' ? '#059669' : '#f59e0b'}; font-weight: bold; text-transform: uppercase;">${order.paymentStatus}</span></p>
+                <p><strong>Order Status:</strong> <span style="color: #1B1B1B; font-weight: bold; text-transform: uppercase;">${order.orderStatus}</span></p>
+                <p><strong>Payment Status:</strong> <span style="color: ${order.paymentStatus === 'completed' ? '#059669' : '#B1123B'}; font-weight: bold; text-transform: uppercase;">${order.paymentStatus}</span></p>
               </div>
               <div>
                 <p><strong>Payment Method:</strong> ${order.paymentMethod}</p>
-                ${order.paymentDetails.trxId ? `<p><strong>Transaction ID:</strong> ${order.paymentDetails.trxId}</p>` : ''}
-                ${order.paymentDetails.walletNumberMasked ? `<p><strong>Wallet:</strong> ${order.paymentDetails.walletNumberMasked}</p>` : ''}
-                ${order.paymentDetails.codNote ? `<p><strong>COD Note:</strong> ${order.paymentDetails.codNote}</p>` : ''}
+                ${order.paymentDetails?.trxId ? `<p><strong>Transaction ID:</strong> ${order.paymentDetails.trxId}</p>` : ''}
+                ${order.paymentDetails?.walletNumberMasked ? `<p><strong>Wallet:</strong> ${order.paymentDetails.walletNumberMasked}</p>` : ''}
+                ${order.paymentDetails?.codNote ? `<p><strong>COD Note:</strong> ${order.paymentDetails.codNote}</p>` : ''}
               </div>
             </div>
           </div>
 
                                            <!-- Pricing Details -->
             <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
-              <h3 style="color: #d97706; margin-top: 0;">Pricing Details</h3>
+              <h3 style="color: #B1123B; margin-top: 0;">Pricing Details</h3>
               <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 14px;">
                 <div>
                   <p><strong>Subtotal:</strong> ${formatCurrency(order.totalAmount)}</p>
                   ${order.discountAmount > 0 ? `<p><strong>Discount:</strong> -${formatCurrency(order.discountAmount)}</p>` : ''}
                   <p><strong>Shipping Cost:</strong> ${formatCurrency(order.shippingCost || 0)}</p>
+                  ${extraFeeRows(order)}
                 </div>
                 <div style="text-align: right;">
                   <p><strong>Grand Total:</strong> ${formatCurrency(order.grandTotal)}</p>
@@ -85,19 +120,15 @@ const emailTemplates = {
           
           <!-- Shipping Information -->
           <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
-            <h3 style="color: #d97706; margin-top: 0;">Shipping Information</h3>
+            <h3 style="color: #B1123B; margin-top: 0;">Shipping Information</h3>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
               <div>
                 <h4 style="color: #374151; margin-top: 0;">Delivery Address</h4>
-                <p style="margin: 5px 0;"><strong>${order.shippingAddress.fullName}</strong></p>
-                <p style="margin: 5px 0;">${order.shippingAddress.address}</p>
-                <p style="margin: 5px 0;">${order.shippingAddress.city}, ${order.shippingAddress.state} ${order.shippingAddress.postalCode}</p>
-                <p style="margin: 5px 0;">${order.shippingAddress.country}</p>
-                <p style="margin: 5px 0;"><strong>Phone:</strong> ${order.shippingAddress.phone}</p>
+                ${addressLines(order)}
               </div>
               <div>
                 <h4 style="color: #374151; margin-top: 0;">Shipping Method</h4>
-                ${order.shipping.name ? `
+                ${order.shipping?.name ? `
                   <p style="margin: 5px 0;"><strong>Method:</strong> ${order.shipping.name}</p>
                   <p style="margin: 5px 0;"><strong>Cost:</strong> ${formatCurrency(order.shipping.charge)}</p>
                   <p style="margin: 5px 0;"><strong>Estimated Delivery:</strong> ${order.shipping.estimatedDays} days</p>
@@ -108,7 +139,7 @@ const emailTemplates = {
           
           <!-- Order Items -->
           <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
-            <h3 style="color: #d97706; margin-top: 0;">Order Items (${order.items.length} item${order.items.length > 1 ? 's' : ''})</h3>
+            <h3 style="color: #B1123B; margin-top: 0;">Order Items (${order.items.length} item${order.items.length > 1 ? 's' : ''})</h3>
             ${order.items.map((item, index) => `
               <div style="border-bottom: 1px solid #eee; padding: 15px 0; ${index === order.items.length - 1 ? 'border-bottom: none;' : ''}">
                 <div style="display: flex; gap: 15px; align-items: start;">
@@ -129,7 +160,7 @@ const emailTemplates = {
                        </div>
                     </div>
                     <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #f3f4f6;">
-                      <p style="margin: 0; font-weight: bold; color: #d97706;">
+                      <p style="margin: 0; font-weight: bold; color: #B1123B;">
                         <strong>Item Total:</strong> ${formatCurrency(item.price * item.quantity)}
                       </p>
                     </div>
@@ -140,17 +171,18 @@ const emailTemplates = {
           </div>
 
                                            <!-- Order Summary -->
-            <div style="background: #fefce8; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #f59e0b;">
-              <h4 style="color: #d97706; margin-top: 0;">Order Summary</h4>
+            <div style="background: #FDF2F5; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+              <h4 style="color: #B1123B; margin-top: 0;">Order Summary</h4>
               <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; font-size: 14px;">
                 <div>
                   <p style="margin: 5px 0;"><strong>Total Items:</strong> ${order.items.reduce((sum, item) => sum + item.quantity, 0)}</p>
                   <p style="margin: 5px 0;"><strong>Subtotal:</strong> ${formatCurrency(order.totalAmount)}</p>
                   ${order.discountAmount > 0 ? `<p style="margin: 5px 0;"><strong>Discount:</strong> -${formatCurrency(order.discountAmount)}</p>` : ''}
                   <p style="margin: 5px 0;"><strong>Shipping:</strong> ${formatCurrency(order.shippingCost || 0)}</p>
+                  ${extraFeeRows(order)}
                 </div>
                 <div style="text-align: right;">
-                  <p style="margin: 5px 0; font-size: 18px; font-weight: bold; color: #d97706;">
+                  <p style="margin: 5px 0; font-size: 18px; font-weight: bold; color: #B1123B;">
                     <strong>Grand Total:</strong> ${formatCurrency(order.grandTotal)}
                   </p>
                 </div>
@@ -162,18 +194,18 @@ const emailTemplates = {
           <!-- Order Tracking Link -->
           <div style="text-align: center; margin: 30px 0;">
             <a href="${process.env.CLIENT_URL}/profile/orders/${order.orderId}" 
-               style="display: inline-block; background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); color: white; padding: 15px 30px; text-decoration: none; border-radius: 8px; font-weight: bold; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+               style="display: inline-block; background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); color: white; padding: 15px 30px; text-decoration: none; border-radius: 8px; font-weight: bold; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
               📋 View Order Details
             </a>
           </div>
           
           <div style="text-align: center; margin: 30px 0;">
-            <p style="color: #d97706; font-weight: bold;">Thank you for choosing Barvella!</p>
+            <p style="color: #B1123B; font-weight: bold;">Thank you for choosing ${BRAND.NAME}!</p>
           </div>
         </div>
         
         <div style="background: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; color: #666;">
-          <p>© ${new Date().getFullYear()} Barvella. All rights reserved.</p>
+          <p>${brandFooter()}</p>
           <p>This is an automated email. Please do not reply to this message.</p>
         </div>
       </div>
@@ -184,28 +216,28 @@ const emailTemplates = {
     subject: `Order Processing - Order #${order.orderId}`,
     html: `
              <div style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
-         <div style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); padding: 20px; text-align: center; color: white;">
+         <div style="background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); padding: 20px; text-align: center; color: white;">
            <div style="display: flex; align-items: center; justify-content: center; gap: 15px; margin-bottom: 10px;">
-             <img src="https://barvella.com/Barvella.png" alt="Barvella Logo" style="width: 60px; height: 60px; object-fit: contain;">
-             <h1 style="margin: 0;">Barvella</h1>
+             <img src="${BRAND.LOGO_URL}" alt="${BRAND.NAME} Logo" style="width: 60px; height: 60px; object-fit: contain;">
+             <h1 style="margin: 0;">${BRAND.NAME}</h1>
            </div>
            <p style="margin: 5px 0;">Premium Fashion & Lifestyle</p>
          </div>
          
          <div style="padding: 20px; background: #f8f9fa;">
-           <h2 style="color: #d97706;">Order Processing Update</h2>
-          <p>Dear ${user?.firstName || ''} ${user?.lastName || ''},</p>
+           <h2 style="color: #B1123B;">Order Processing Update</h2>
+          <p>Dear ${greetName(user, order)},</p>
           <p>Great news! Your order is now being processed and prepared for shipment.</p>
           
           <!-- Order Summary -->
-          <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3b82f6;">
-            <h3 style="color: #d97706; margin-top: 0;">Order Details</h3>
+          <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+            <h3 style="color: #B1123B; margin-top: 0;">Order Details</h3>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
               <div>
                 <p><strong>Order ID:</strong> #${order.orderId}</p>
                 <p><strong>Order Date:</strong> ${formatDate(order.createdAt)}</p>
-                <p><strong>Status:</strong> <span style="color: #3b82f6; font-weight: bold; text-transform: uppercase;">PROCESSING</span></p>
-                <p><strong>Payment Status:</strong> <span style="color: ${order.paymentStatus === 'completed' ? '#059669' : '#f59e0b'}; font-weight: bold; text-transform: uppercase;">${order.paymentStatus}</span></p>
+                <p><strong>Status:</strong> <span style="color: #B1123B; font-weight: bold; text-transform: uppercase;">PROCESSING</span></p>
+                <p><strong>Payment Status:</strong> <span style="color: ${order.paymentStatus === 'completed' ? '#059669' : '#B1123B'}; font-weight: bold; text-transform: uppercase;">${order.paymentStatus}</span></p>
               </div>
                              <div>
                  <p><strong>Payment Method:</strong> ${order.paymentMethod}</p>
@@ -216,20 +248,16 @@ const emailTemplates = {
           </div>
           
           <!-- Shipping Information -->
-          <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3b82f6;">
-            <h3 style="color: #d97706; margin-top: 0;">Shipping Information</h3>
+          <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+            <h3 style="color: #B1123B; margin-top: 0;">Shipping Information</h3>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
               <div>
                 <h4 style="color: #374151; margin-top: 0;">Delivery Address</h4>
-                <p style="margin: 5px 0;"><strong>${order.shippingAddress.fullName}</strong></p>
-                <p style="margin: 5px 0;">${order.shippingAddress.address}</p>
-                <p style="margin: 5px 0;">${order.shippingAddress.city}, ${order.shippingAddress.state} ${order.shippingAddress.postalCode}</p>
-                <p style="margin: 5px 0;">${order.shippingAddress.country}</p>
-                <p style="margin: 5px 0;"><strong>Phone:</strong> ${order.shippingAddress.phone}</p>
+                ${addressLines(order)}
               </div>
               <div>
                 <h4 style="color: #374151; margin-top: 0;">Shipping Method</h4>
-                ${order.shipping.name ? `
+                ${order.shipping?.name ? `
                   <p style="margin: 5px 0;"><strong>Method:</strong> ${order.shipping.name}</p>
                   <p style="margin: 5px 0;"><strong>Cost:</strong> ${formatCurrency(order.shipping.charge)}</p>
                   <p style="margin: 5px 0;"><strong>Estimated Delivery:</strong> ${order.shipping.estimatedDays} days</p>
@@ -239,22 +267,22 @@ const emailTemplates = {
           </div>
           
           <!-- Processing Status -->
-          <div style="background: #e0f2fe; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3b82f6;">
-            <h4 style="color: #1e40af; margin-top: 0;">What's happening now?</h4>
-            <ul style="color: #1e40af;">
+          <div style="background: #FDF2F5; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+            <h4 style="color: #8F0E2F; margin-top: 0;">What's happening now?</h4>
+            <ul style="color: #8F0E2F;">
               <li>Your items are being carefully inspected</li>
               <li>Quality checks are being performed</li>
               <li>Packaging is being prepared</li>
               <li>Shipping labels are being generated</li>
             </ul>
-            <p style="color: #1e40af; margin-top: 15px; font-weight: bold;">
+            <p style="color: #8F0E2F; margin-top: 15px; font-weight: bold;">
               Estimated processing time: 1-2 business days
             </p>
           </div>
 
           <!-- Order Items Summary -->
           <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
-            <h3 style="color: #d97706; margin-top: 0;">Order Items Summary</h3>
+            <h3 style="color: #B1123B; margin-top: 0;">Order Items Summary</h3>
             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
               ${order.items.map(item => `
                 <div style="border: 1px solid #e5e7eb; border-radius: 8px; padding: 15px;">
@@ -276,18 +304,18 @@ const emailTemplates = {
           <!-- Order Tracking Link -->
           <div style="text-align: center; margin: 30px 0;">
             <a href="${process.env.CLIENT_URL}/profile/orders/${order.orderId}" 
-               style="display: inline-block; background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%); color: white; padding: 15px 30px; text-decoration: none; border-radius: 8px; font-weight: bold; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+               style="display: inline-block; background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); color: white; padding: 15px 30px; text-decoration: none; border-radius: 8px; font-weight: bold; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
               📋 Track Order Status
             </a>
           </div>
           
           <div style="text-align: center; margin: 30px 0;">
-            <p style="color: #d97706; font-weight: bold;">Thank you for your patience!</p>
+            <p style="color: #B1123B; font-weight: bold;">Thank you for your patience!</p>
           </div>
         </div>
         
         <div style="background: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; color: #666;">
-          <p>© ${new Date().getFullYear()} Barvella. All rights reserved.</p>
+          <p>${brandFooter()}</p>
           <p>This is an automated email. Please do not reply to this message.</p>
         </div>
       </div>
@@ -298,25 +326,25 @@ const emailTemplates = {
     subject: `Order Delivered - Order #${order.orderId}`,
     html: `
       <div style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
-        <div style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); padding: 20px; text-align: center; color: white;">
-          <h1 style="margin: 0;">Barvella</h1>
+        <div style="background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); padding: 20px; text-align: center; color: white;">
+          <h1 style="margin: 0;">${BRAND.NAME}</h1>
           <p style="margin: 5px 0;">Premium Fashion & Lifestyle</p>
         </div>
         
         <div style="padding: 20px; background: #f8f9fa;">
-          <h2 style="color: #d97706;">Order Delivered Successfully!</h2>
-          <p>Dear ${user?.firstName || ''} ${user?.lastName || ''},</p>
+          <h2 style="color: #B1123B;">Order Delivered Successfully!</h2>
+          <p>Dear ${greetName(user, order)},</p>
           <p>🎉 Your order has been successfully delivered! We hope you love your new items.</p>
           
           <!-- Order Summary -->
-          <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #059669;">
-            <h3 style="color: #d97706; margin-top: 0;">Order Details</h3>
+          <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+            <h3 style="color: #B1123B; margin-top: 0;">Order Details</h3>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
               <div>
                 <p><strong>Order ID:</strong> #${order.orderId}</p>
                 <p><strong>Order Date:</strong> ${formatDate(order.createdAt)}</p>
                 <p><strong>Status:</strong> <span style="color: #059669; font-weight: bold; text-transform: uppercase;">DELIVERED</span></p>
-                <p><strong>Payment Status:</strong> <span style="color: ${order.paymentStatus === 'completed' ? '#059669' : '#f59e0b'}; font-weight: bold; text-transform: uppercase;">${order.paymentStatus}</span></p>
+                <p><strong>Payment Status:</strong> <span style="color: ${order.paymentStatus === 'completed' ? '#059669' : '#B1123B'}; font-weight: bold; text-transform: uppercase;">${order.paymentStatus}</span></p>
               </div>
                              <div>
                  <p><strong>Payment Method:</strong> ${order.paymentMethod}</p>
@@ -327,23 +355,23 @@ const emailTemplates = {
           </div>
           
           <!-- Delivery Information -->
-          <div style="background: #f0fdf4; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #059669;">
-            <h4 style="color: #059669; margin-top: 0;">Delivery Information</h4>
-            <p style="color: #059669; margin: 5px 0;"><strong>Delivered to:</strong> ${order.shippingAddress.fullName}</p>
-            <p style="color: #059669; margin: 5px 0;"><strong>Address:</strong> ${order.shippingAddress.address}, ${order.shippingAddress.city}, ${order.shippingAddress.state} ${order.shippingAddress.postalCode}</p>
-            <p style="color: #059669; margin: 5px 0;"><strong>Phone:</strong> ${order.shippingAddress.phone}</p>
-            ${order.shipping.name ? `
-              <p style="color: #059669; margin: 5px 0;"><strong>Shipping Method:</strong> ${order.shipping.name}</p>
-              <p style="color: #059669; margin: 5px 0;"><strong>Shipping Cost:</strong> ${formatCurrency(order.shipping.charge)}</p>
+          <div style="background: #FDF2F5; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+            <h4 style="color: #8F0E2F; margin-top: 0;">Delivery Information</h4>
+            <p style="color: #8F0E2F; margin: 5px 0;"><strong>Delivered to:</strong> ${order.shippingAddress?.fullName || ''}</p>
+            <p style="color: #8F0E2F; margin: 5px 0;"><strong>Address:</strong> ${[order.shippingAddress?.address, order.shippingAddress?.city, order.shippingAddress?.state, order.shippingAddress?.postalCode].filter(Boolean).join(', ')}</p>
+            <p style="color: #8F0E2F; margin: 5px 0;"><strong>Phone:</strong> ${order.shippingAddress?.phone || ''}</p>
+            ${order.shipping?.name ? `
+              <p style="color: #8F0E2F; margin: 5px 0;"><strong>Shipping Method:</strong> ${order.shipping.name}</p>
+              <p style="color: #8F0E2F; margin: 5px 0;"><strong>Shipping Cost:</strong> ${formatCurrency(order.shipping.charge)}</p>
             ` : ''}
-            <p style="color: #059669; margin: 15px 0 0 0; font-weight: bold;">
+            <p style="color: #8F0E2F; margin: 15px 0 0 0; font-weight: bold;">
               Delivery completed on: ${formatDate(new Date())}
             </p>
           </div>
 
           <!-- Order Items Summary -->
           <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
-            <h3 style="color: #d97706; margin-top: 0;">Delivered Items</h3>
+            <h3 style="color: #B1123B; margin-top: 0;">Delivered Items</h3>
             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
               ${order.items.map(item => `
                 <div style="border: 1px solid #e5e7eb; border-radius: 8px; padding: 15px;">
@@ -361,9 +389,9 @@ const emailTemplates = {
           </div>
           
           <!-- Next Steps -->
-          <div style="background: #fefce8; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #f59e0b;">
-            <h4 style="color: #d97706; margin-top: 0;">What's next?</h4>
-            <ul style="color: #d97706;">
+          <div style="background: #FDF2F5; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+            <h4 style="color: #B1123B; margin-top: 0;">What's next?</h4>
+            <ul style="color: #B1123B;">
               <li>Please inspect your items upon delivery</li>
               <li>You have 7 days to return if needed</li>
               <li>Share your experience with us</li>
@@ -372,27 +400,27 @@ const emailTemplates = {
           </div>
           
           <!-- Quality Guarantee -->
-          <div style="background: #f0fdf4; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #059669;">
-            <h4 style="color: #059669; margin-top: 0;">Quality Guarantee</h4>
-            <p style="color: #059669; margin: 0;">All our products come with a quality guarantee. If you're not completely satisfied, please contact our customer service within 7 days.</p>
+          <div style="background: #FDF2F5; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+            <h4 style="color: #8F0E2F; margin-top: 0;">Quality Guarantee</h4>
+            <p style="color: #8F0E2F; margin: 0;">All our products come with a quality guarantee. If you're not completely satisfied, please contact our customer service within 7 days.</p>
           </div>
           
           <div style="text-align: center; margin: 30px 0;">
-            <p style="color: #d97706; font-weight: bold;">Thank you for choosing Barvella!</p>
+            <p style="color: #B1123B; font-weight: bold;">Thank you for choosing ${BRAND.NAME}!</p>
             <p style="color: #666;">We hope to see you again soon.</p>
           </div>
           
           <!-- Order Details Link -->
           <div style="text-align: center; margin: 20px 0;">
             <a href="${process.env.CLIENT_URL}/profile/orders/${order.orderId}" 
-               style="display: inline-block; background: linear-gradient(135deg, #059669 0%, #047857 100%); color: white; padding: 12px 25px; text-decoration: none; border-radius: 6px; font-weight: bold; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);">
+               style="display: inline-block; background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); color: white; padding: 12px 25px; text-decoration: none; border-radius: 6px; font-weight: bold; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);">
               📋 View Order Details
             </a>
           </div>
         </div>
         
         <div style="background: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; color: #666;">
-          <p>© ${new Date().getFullYear()} Barvella. All rights reserved.</p>
+          <p>${brandFooter()}</p>
           <p>This is an automated email. Please do not reply to this message.</p>
         </div>
       </div>
@@ -403,25 +431,25 @@ const emailTemplates = {
     subject: `Order Shipped - Order #${order.orderId}`,
     html: `
       <div style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
-        <div style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); padding: 20px; text-align: center; color: white;">
-          <h1 style="margin: 0;">Barvella</h1>
+        <div style="background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); padding: 20px; text-align: center; color: white;">
+          <h1 style="margin: 0;">${BRAND.NAME}</h1>
           <p style="margin: 5px 0;">Premium Fashion & Lifestyle</p>
         </div>
         
         <div style="padding: 20px; background: #f8f9fa;">
-          <h2 style="color: #d97706;">Your Order is on the Way! 🚚</h2>
-          <p>Dear ${user?.firstName || ''} ${user?.lastName || ''},</p>
+          <h2 style="color: #B1123B;">Your Order is on the Way! 🚚</h2>
+          <p>Dear ${greetName(user, order)},</p>
           <p>Great news! Your order has been shipped and is on its way to you.</p>
           
           <!-- Order Summary -->
-          <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #8b5cf6;">
-            <h3 style="color: #d97706; margin-top: 0;">Order Details</h3>
+          <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+            <h3 style="color: #B1123B; margin-top: 0;">Order Details</h3>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
               <div>
                 <p><strong>Order ID:</strong> #${order.orderId}</p>
                 <p><strong>Order Date:</strong> ${formatDate(order.createdAt)}</p>
-                <p><strong>Status:</strong> <span style="color: #8b5cf6; font-weight: bold; text-transform: uppercase;">SHIPPED</span></p>
-                <p><strong>Payment Status:</strong> <span style="color: ${order.paymentStatus === 'completed' ? '#059669' : '#f59e0b'}; font-weight: bold; text-transform: uppercase;">${order.paymentStatus}</span></p>
+                <p><strong>Status:</strong> <span style="color: #B1123B; font-weight: bold; text-transform: uppercase;">SHIPPED</span></p>
+                <p><strong>Payment Status:</strong> <span style="color: ${order.paymentStatus === 'completed' ? '#059669' : '#B1123B'}; font-weight: bold; text-transform: uppercase;">${order.paymentStatus}</span></p>
               </div>
                              <div>
                  <p><strong>Payment Method:</strong> ${order.paymentMethod}</p>
@@ -432,24 +460,24 @@ const emailTemplates = {
           </div>
           
           <!-- Shipping Information -->
-          <div style="background: #f3f4f6; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #8b5cf6;">
-            <h4 style="color: #7c3aed; margin-top: 0;">Shipping Information</h4>
-            <p style="color: #7c3aed; margin: 5px 0;"><strong>Shipping to:</strong> ${order.shippingAddress.fullName}</p>
-            <p style="color: #7c3aed; margin: 5px 0;"><strong>Address:</strong> ${order.shippingAddress.address}, ${order.shippingAddress.city}, ${order.shippingAddress.state} ${order.shippingAddress.postalCode}</p>
-            <p style="color: #7c3aed; margin: 5px 0;"><strong>Phone:</strong> ${order.shippingAddress.phone}</p>
-            ${order.shipping.name ? `
-              <p style="color: #7c3aed; margin: 5px 0;"><strong>Shipping Method:</strong> ${order.shipping.name}</p>
-              <p style="color: #7c3aed; margin: 5px 0;"><strong>Shipping Cost:</strong> ${formatCurrency(order.shipping.charge)}</p>
-              <p style="color: #7c3aed; margin: 5px 0;"><strong>Estimated Delivery:</strong> ${order.shipping.estimatedDays} days</p>
+          <div style="background: #F3F4F6; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+            <h4 style="color: #8F0E2F; margin-top: 0;">Shipping Information</h4>
+            <p style="color: #8F0E2F; margin: 5px 0;"><strong>Shipping to:</strong> ${order.shippingAddress?.fullName || ''}</p>
+            <p style="color: #8F0E2F; margin: 5px 0;"><strong>Address:</strong> ${[order.shippingAddress?.address, order.shippingAddress?.city, order.shippingAddress?.state, order.shippingAddress?.postalCode].filter(Boolean).join(', ')}</p>
+            <p style="color: #8F0E2F; margin: 5px 0;"><strong>Phone:</strong> ${order.shippingAddress?.phone || ''}</p>
+            ${order.shipping?.name ? `
+              <p style="color: #8F0E2F; margin: 5px 0;"><strong>Shipping Method:</strong> ${order.shipping.name}</p>
+              <p style="color: #8F0E2F; margin: 5px 0;"><strong>Shipping Cost:</strong> ${formatCurrency(order.shipping.charge)}</p>
+              <p style="color: #8F0E2F; margin: 5px 0;"><strong>Estimated Delivery:</strong> ${order.shipping.estimatedDays} days</p>
             ` : ''}
-            <p style="color: #7c3aed; margin: 15px 0 0 0; font-weight: bold;">
+            <p style="color: #8F0E2F; margin: 15px 0 0 0; font-weight: bold;">
               Shipped on: ${formatDate(new Date())}
             </p>
           </div>
 
           <!-- Order Items Summary -->
           <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
-            <h3 style="color: #d97706; margin-top: 0;">Shipped Items</h3>
+            <h3 style="color: #B1123B; margin-top: 0;">Shipped Items</h3>
             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
               ${order.items.map(item => `
                 <div style="border: 1px solid #e5e7eb; border-radius: 8px; padding: 15px;">
@@ -467,9 +495,9 @@ const emailTemplates = {
           </div>
           
           <!-- Delivery Instructions -->
-          <div style="background: #fefce8; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #f59e0b;">
-            <h4 style="color: #d97706; margin-top: 0;">Delivery Instructions</h4>
-            <ul style="color: #d97706;">
+          <div style="background: #FDF2F5; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+            <h4 style="color: #B1123B; margin-top: 0;">Delivery Instructions</h4>
+            <ul style="color: #B1123B;">
               <li>Please ensure someone is available to receive the package</li>
               <li>Have your ID ready for verification if required</li>
               <li>Inspect the package before signing</li>
@@ -478,25 +506,25 @@ const emailTemplates = {
           </div>
           
           <!-- Tracking Information -->
-          <div style="background: #e0f2fe; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3b82f6;">
-            <h4 style="color: #1e40af; margin-top: 0;">Track Your Order</h4>
-            <p style="color: #1e40af; margin: 0;">You can track your order status by logging into your account or contacting our customer service.</p>
+          <div style="background: #FDF2F5; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+            <h4 style="color: #8F0E2F; margin-top: 0;">Track Your Order</h4>
+            <p style="color: #8F0E2F; margin: 0;">You can track your order status by logging into your account or contacting our customer service.</p>
             <div style="text-align: center; margin-top: 15px;">
               <a href="${process.env.CLIENT_URL}/profile/orders/${order.orderId}" 
-                 style="display: inline-block; background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%); color: white; padding: 12px 25px; text-decoration: none; border-radius: 6px; font-weight: bold; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);">
+                 style="display: inline-block; background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); color: white; padding: 12px 25px; text-decoration: none; border-radius: 6px; font-weight: bold; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);">
                 🚚 Track Order
               </a>
             </div>
           </div>
           
           <div style="text-align: center; margin: 30px 0;">
-            <p style="color: #d97706; font-weight: bold;">Your order is on its way!</p>
+            <p style="color: #B1123B; font-weight: bold;">Your order is on its way!</p>
             <p style="color: #666;">We'll notify you once it's delivered.</p>
           </div>
         </div>
         
         <div style="background: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; color: #666;">
-          <p>© ${new Date().getFullYear()} Barvella. All rights reserved.</p>
+          <p>${brandFooter()}</p>
           <p>This is an automated email. Please do not reply to this message.</p>
         </div>
       </div>
@@ -506,23 +534,23 @@ const emailTemplates = {
     subject: `Receipt - Order #${posOrder.orderNumber}`,
     html: `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-        <div style="background: linear-gradient(135deg, #059669 0%, #047857 100%); padding: 20px; text-align: center; color: white;">
-          <img src="https://barvella.com/Barvella.png" alt="Barvella" style="width: 50px; height: 50px; object-fit: contain;">
-          <h1 style="margin: 5px 0;">Barvella</h1>
+        <div style="background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); padding: 20px; text-align: center; color: white;">
+          <img src="${BRAND.LOGO_URL}" alt="${BRAND.NAME}" style="width: 50px; height: 50px; object-fit: contain;">
+          <h1 style="margin: 5px 0;">${BRAND.NAME}</h1>
           <p style="margin: 0;">POS Receipt</p>
         </div>
         <div style="padding: 20px; background: #f8f9fa;">
           <p>Dear ${posOrder.customer.name},</p>
-          <p>Thank you for your purchase at Barvella! Here is your receipt.</p>
-          <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #059669;">
-            <h3 style="color: #047857; margin-top: 0;">Receipt Summary</h3>
+          <p>Thank you for your purchase at ${BRAND.NAME}! Here is your receipt.</p>
+          <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+            <h3 style="color: #8F0E2F; margin-top: 0;">Receipt Summary</h3>
             <p><strong>Order #:</strong> ${posOrder.orderNumber}</p>
             <p><strong>Date:</strong> ${formatDate(posOrder.createdAt)}</p>
             <p><strong>Payment:</strong> ${posOrder.paymentMethod}</p>
           </div>
           <table style="width: 100%; border-collapse: collapse; margin: 20px 0; background: white; border-radius: 8px; overflow: hidden;">
             <thead>
-              <tr style="background: #059669; color: white;">
+              <tr style="background: #B1123B; color: white;">
                 <th style="padding: 10px; text-align: left;">Item</th>
                 <th style="padding: 10px; text-align: center;">Qty</th>
                 <th style="padding: 10px; text-align: right;">Price</th>
@@ -534,7 +562,7 @@ const emailTemplates = {
                 <tr style="border-bottom: 1px solid #e5e7eb;">
                   <td style="padding: 10px;">
                     <strong>${item.productName}</strong>
-                    ${item.variantInfo?.size ? `<br><span style="font-size: 12px; color: #666;">Size: ${item.variantInfo.size}${item.variantInfo.color ? ', ' + item.variantInfo.color : ''}</span>` : ''}
+                    ${item.variantInfo?.size ? `<br><span style="font-size: 12px; color: #666;">${item.variantInfo.measureType || 'Size'}: ${item.variantInfo.size}${item.variantInfo.unitName ? ' ' + item.variantInfo.unitName : ''}${item.variantInfo.color ? ', ' + item.variantInfo.color : ''}</span>` : ''}
                   </td>
                   <td style="padding: 10px; text-align: center;">${item.quantity}</td>
                   <td style="padding: 10px; text-align: right;">${formatCurrency(item.discountPrice || item.unitPrice)}</td>
@@ -549,17 +577,17 @@ const emailTemplates = {
               <div style="text-align: right;"><p>${formatCurrency(posOrder.subtotal)}</p></div>
               ${posOrder.tax > 0 ? `<div><p><strong>Tax:</strong></p></div><div style="text-align: right;"><p>${formatCurrency(posOrder.tax)}</p></div>` : ''}
               ${posOrder.discount > 0 ? `<div><p><strong>Discount:</strong></p></div><div style="text-align: right;"><p>-${formatCurrency(posOrder.discount)}</p></div>` : ''}
-              <div style="border-top: 2px solid #059669; padding-top: 10px;"><p><strong>Total:</strong></p></div>
-              <div style="border-top: 2px solid #059669; padding-top: 10px; text-align: right;"><p><strong>${formatCurrency(posOrder.total)}</strong></p></div>
+          <div style="border-top: 2px solid #B1123B; padding-top: 10px;"><p><strong>Total:</strong></p></div>
+          <div style="border-top: 2px solid #B1123B; padding-top: 10px; text-align: right;"><p><strong>${formatCurrency(posOrder.total)}</strong></p></div>
             </div>
           </div>
           <div style="text-align: center; margin: 20px 0;">
-            <p style="color: #059669; font-weight: bold;">Thank you for shopping at Barvella!</p>
-            <p style="color: #666; font-size: 13px;">Visit us again at barvella.com</p>
+            <p style="color: #B1123B; font-weight: bold;">Thank you for shopping at ${BRAND.NAME}!</p>
+            <p style="color: #666; font-size: 13px;">Visit us again at ${BRAND.SITE_HOST}</p>
           </div>
         </div>
         <div style="background: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; color: #666;">
-          <p>© ${new Date().getFullYear()} Barvella. All rights reserved.</p>
+          <p>${brandFooter()}</p>
           <p>This is an automated receipt. Please do not reply.</p>
         </div>
       </div>
@@ -586,31 +614,31 @@ const sendEmail = async (to, template, data) => {
     } else if (template === 'email_update_otp') {
       // For email update OTP
       emailContent = {
-        subject: 'Email Update Verification - Barvella',
+        subject: `Email Update Verification - ${BRAND.NAME}`,
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-            <div style="background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%); padding: 30px; text-align: center; color: white; border-radius: 10px 10px 0 0;">
+            <div style="background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); padding: 30px; text-align: center; color: white; border-radius: 10px 10px 0 0;">
               <div style="display: flex; align-items: center; justify-content: center; gap: 15px; margin-bottom: 10px;">
-                <img src="https://barvella.com/Barvella.png" alt="Barvella Logo" style="width: 60px; height: 60px; object-fit: contain;">
+                <img src="${BRAND.LOGO_URL}" alt="${BRAND.NAME} Logo" style="width: 60px; height: 60px; object-fit: contain;">
                 <h1 style="margin: 0;">Email Update Verification</h1>
               </div>
               <p style="margin: 5px 0;">Verify your new email address</p>
             </div>
             
             <div style="background: #f8f9fa; padding: 30px; border-radius: 0 0 10px 10px;">
-              <h2 style="color: #1d4ed8; margin-top: 0;">Email Update Request</h2>
+              <h2 style="color: #B1123B; margin-top: 0;">Email Update Request</h2>
               <p>Hello,</p>
               <p>We received a request to update your email address to: <strong>${data.newEmail}</strong></p>
               <p>To complete this process, please use the verification code below:</p>
               
-              <div style="background: white; padding: 30px; border-radius: 8px; margin: 30px 0; text-align: center; border: 2px solid #3b82f6;">
-                <h1 style="color: #1d4ed8; font-size: 48px; letter-spacing: 8px; margin: 0; font-family: monospace;">${data.otp}</h1>
+              <div style="background: white; padding: 30px; border-radius: 8px; margin: 30px 0; text-align: center; border: 2px solid #B1123B;">
+                <h1 style="color: #B1123B; font-size: 48px; letter-spacing: 8px; margin: 0; font-family: monospace;">${data.otp}</h1>
                 <p style="color: #6b7280; margin-top: 10px;">Verification Code</p>
               </div>
               
-              <div style="background: #dbeafe; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3b82f6;">
-                <h4 style="color: #1d4ed8; margin-top: 0;">Important Information</h4>
-                <ul style="color: #1d4ed8;">
+              <div style="background: #FDF2F5; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+                <h4 style="color: #8F0E2F; margin-top: 0;">Important Information</h4>
+                <ul style="color: #8F0E2F;">
                   <li>This code will expire in 10 minutes</li>
                   <li>If you didn't request this change, please ignore this email</li>
                   <li>For security, you'll be logged out after updating your email</li>
@@ -618,13 +646,13 @@ const sendEmail = async (to, template, data) => {
               </div>
               
               <div style="text-align: center; margin: 30px 0;">
-                <p style="color: #1d4ed8; font-weight: bold;">Thank you for choosing Barvella!</p>
+                <p style="color: #B1123B; font-weight: bold;">Thank you for choosing ${BRAND.NAME}!</p>
                 <p style="color: #6b7280;">If you have any questions, please contact our support team.</p>
               </div>
             </div>
             
             <div style="background: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; color: #666; border-radius: 10px; margin-top: 20px;">
-              <p>© ${new Date().getFullYear()} Barvella. All rights reserved.</p>
+              <p>${brandFooter()}</p>
               <p>This is an automated email. Please do not reply to this message.</p>
             </div>
           </div>
@@ -636,7 +664,7 @@ const sendEmail = async (to, template, data) => {
     }
     
     const mailOptions = {
-      from: `"Barvella" <${process.env.EMAIL_USER}>`,
+      from: brandFrom(),
       to: to,
       subject: emailContent.subject,
       html: emailContent.html
@@ -647,7 +675,7 @@ const sendEmail = async (to, template, data) => {
     return { success: true, messageId: result.messageId };
   } catch (error) {
     console.error(`❌ Failed to send email to ${to}:`, error.message);
-    return { success: false, error: error.message };
+    return { success: false, error: error.message, message: error.message };
   }
 };
 
@@ -663,7 +691,7 @@ const sendCustomEmail = async ({ to, subject, html, text }) => {
     }
 
     const mailOptions = {
-      from: `"Belorella" <${process.env.EMAIL_USER}>`,
+      from: brandFrom(),
       to,
       subject,
       html,
@@ -675,7 +703,7 @@ const sendCustomEmail = async ({ to, subject, html, text }) => {
     return { success: true, messageId: result.messageId };
   } catch (error) {
     console.error(`❌ Failed to send custom email to ${to}:`, error.message);
-    return { success: false, error: error.message };
+    return { success: false, error: error.message, message: error.message };
   }
 };
 
@@ -701,6 +729,7 @@ const sendOrderDelivered = async (order, user) => {
 
 const sendOrderCancelled = async (order, user) => {
   try {
+    if (!user?.email) return { success: false, message: 'No recipient email for cancelled order' };
     const subject = `Order #${order.orderId} Cancelled`;
     
     const html = `
@@ -713,9 +742,9 @@ const sendOrderCancelled = async (order, user) => {
         <style>
           body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
           .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-          .header { background: linear-gradient(135deg, #ff6b6b, #ee5a52); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
+          .header { background: linear-gradient(135deg, #B1123B, #8F0E2F); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
           .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
-          .order-details { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #ff6b6b; }
+          .order-details { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B; }
           .item { display: flex; gap: 15px; padding: 15px 0; border-bottom: 1px solid #eee; }
           .item:last-child { border-bottom: none; }
           .item-image { width: 80px; height: 80px; background: #f3f4f6; border-radius: 8px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; border: 1px solid #e5e7eb; }
@@ -727,16 +756,16 @@ const sendOrderCancelled = async (order, user) => {
           .total-row { display: flex; justify-content: space-between; margin: 10px 0; }
           .total-row.final { font-weight: bold; font-size: 18px; border-top: 2px solid #eee; padding-top: 10px; }
           .footer { text-align: center; margin-top: 30px; color: #666; font-size: 14px; }
-          .cancellation-notice { background: #fff3cd; border: 1px solid #ffeaa7; padding: 15px; border-radius: 8px; margin: 20px 0; }
-          .cancellation-notice h3 { color: #856404; margin: 0 0 10px 0; }
-          .cancellation-notice p { color: #856404; margin: 0; }
+          .cancellation-notice { background: #FDF2F5; border: 1px solid #F3C6D3; padding: 15px; border-radius: 8px; margin: 20px 0; }
+          .cancellation-notice h3 { color: #8F0E2F; margin: 0 0 10px 0; }
+          .cancellation-notice p { color: #8F0E2F; margin: 0; }
         </style>
       </head>
       <body>
         <div class="container">
                      <div class="header">
              <div style="display: flex; align-items: center; justify-content: center; gap: 15px; margin-bottom: 10px;">
-               <img src="https://barvella.com/Barvella.png" alt="Barvella Logo" style="width: 60px; height: 60px; object-fit: contain;">
+               <img src="${BRAND.LOGO_URL}" alt="${BRAND.NAME} Logo" style="width: 60px; height: 60px; object-fit: contain;">
                <h1 style="margin: 0;">Order Cancelled</h1>
              </div>
              <p>We're sorry to inform you that your order has been cancelled</p>
@@ -752,7 +781,7 @@ const sendOrderCancelled = async (order, user) => {
               <h2>Order Details</h2>
               <p><strong>Order ID:</strong> #${order.orderId}</p>
               <p><strong>Order Date:</strong> ${formatDate(order.createdAt)}</p>
-              <p><strong>Status:</strong> <span style="color: #ff6b6b; font-weight: bold;">Cancelled</span></p>
+              <p><strong>Status:</strong> <span style="color: #B1123B; font-weight: bold;">Cancelled</span></p>
               <p><strong>Customer:</strong> ${user.fullName}</p>
               <p><strong>Email:</strong> ${user.email}</p>
             </div>
@@ -794,6 +823,12 @@ const sendOrderCancelled = async (order, user) => {
                 <span>Shipping:</span>
                 <span>${formatCurrency(order.shippingCost || 0)}</span>
               </div>
+              ${order.extraFeeTotal > 0 ? `
+                <div class="total-row">
+                  <span>Extra Fees:</span>
+                  <span>${formatCurrency(order.extraFeeTotal)}</span>
+                </div>
+              ` : ''}
               <div class="total-row final">
                 <span>Total:</span>
                 <span>${formatCurrency(order.grandTotal)}</span>
@@ -803,11 +838,11 @@ const sendOrderCancelled = async (order, user) => {
             <div class="order-details">
               <h3>Shipping Information</h3>
               <p><strong>Address:</strong></p>
-              <p>${order.shippingAddress.fullName}<br>
-              ${order.shippingAddress.address}<br>
-              ${order.shippingAddress.city}, ${order.shippingAddress.state} ${order.shippingAddress.postalCode}<br>
-              ${order.shippingAddress.country}<br>
-              Phone: ${order.shippingAddress.phone}</p>
+              <p>${order.shippingAddress?.fullName || ''}<br>
+              ${order.shippingAddress?.address || ''}<br>
+              ${[order.shippingAddress?.city, order.shippingAddress?.state, order.shippingAddress?.postalCode].filter(Boolean).join(', ')}<br>
+              ${order.shippingAddress?.country || ''}<br>
+              Phone: ${order.shippingAddress?.phone || ''}</p>
               
               ${order.shipping ? `
                 <p><strong>Shipping Method:</strong> ${order.shipping.name}</p>
@@ -830,7 +865,7 @@ const sendOrderCancelled = async (order, user) => {
             <!-- Order Details Link -->
             <div style="text-align: center; margin: 20px 0;">
               <a href="${process.env.CLIENT_URL}/profile/orders/${order.orderId}" 
-                 style="display: inline-block; background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%); color: white; padding: 12px 25px; text-decoration: none; border-radius: 6px; font-weight: bold; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);">
+                 style="display: inline-block; background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); color: white; padding: 12px 25px; text-decoration: none; border-radius: 6px; font-weight: bold; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);">
                 📋 View Order Details
               </a>
             </div>
@@ -841,7 +876,7 @@ const sendOrderCancelled = async (order, user) => {
     `;
 
     const result = await transporter.sendMail({
-      from: `"${process.env.EMAIL_FROM_NAME}" <${process.env.EMAIL_FROM}>`,
+      from: brandFrom(),
       to: user.email,
       subject: subject,
       html: html
@@ -857,6 +892,7 @@ const sendOrderCancelled = async (order, user) => {
 // Send order finalization email
 const sendOrderFinalization = async (order, user) => {
   try {
+    if (!user?.email) return { success: false, message: 'No recipient email for finalized order' };
     const subject = `Order Finalized - Order #${order.orderId}`;
     
     const html = `
@@ -869,9 +905,9 @@ const sendOrderFinalization = async (order, user) => {
         <style>
           body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
           .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-          .header { background: linear-gradient(135deg, #059669, #047857); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
+          .header { background: linear-gradient(135deg, #B1123B, #8F0E2F); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
           .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
-          .order-details { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #059669; }
+          .order-details { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B; }
           .item { display: flex; gap: 15px; padding: 15px 0; border-bottom: 1px solid #eee; }
           .item:last-child { border-bottom: none; }
           .item-image { width: 80px; height: 80px; background: #f3f4f6; border-radius: 8px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; border: 1px solid #e5e7eb; }
@@ -883,16 +919,16 @@ const sendOrderFinalization = async (order, user) => {
           .total-row { display: flex; justify-content: space-between; margin: 10px 0; }
           .total-row.final { font-weight: bold; font-size: 18px; border-top: 2px solid #eee; padding-top: 10px; }
           .footer { text-align: center; margin-top: 30px; color: #666; font-size: 14px; }
-          .finalization-notice { background: #d1fae5; border: 1px solid #a7f3d0; padding: 15px; border-radius: 8px; margin: 20px 0; }
-          .finalization-notice h3 { color: #047857; margin: 0 0 10px 0; }
-          .finalization-notice p { color: #047857; margin: 0; }
+          .finalization-notice { background: #FDF2F5; border: 1px solid #F3C6D3; padding: 15px; border-radius: 8px; margin: 20px 0; }
+          .finalization-notice h3 { color: #8F0E2F; margin: 0 0 10px 0; }
+          .finalization-notice p { color: #8F0E2F; margin: 0; }
         </style>
       </head>
       <body>
         <div class="container">
                      <div class="header">
              <div style="display: flex; align-items: center; justify-content: center; gap: 15px; margin-bottom: 10px;">
-               <img src="https://barvella.com/Barvella.png" alt="Barvella Logo" style="width: 60px; height: 60px; object-fit: contain;">
+               <img src="${BRAND.LOGO_URL}" alt="${BRAND.NAME} Logo" style="width: 60px; height: 60px; object-fit: contain;">
                <h1 style="margin: 0;">Order Finalized</h1>
              </div>
              <p>Your order has been finalized and is ready for processing</p>
@@ -950,6 +986,12 @@ const sendOrderFinalization = async (order, user) => {
                 <span>Shipping:</span>
                 <span>${formatCurrency(order.shippingCost || 0)}</span>
               </div>
+              ${order.extraFeeTotal > 0 ? `
+                <div class="total-row">
+                  <span>Extra Fees:</span>
+                  <span>${formatCurrency(order.extraFeeTotal)}</span>
+                </div>
+              ` : ''}
               <div class="total-row final">
                 <span>Grand Total:</span>
                 <span>${formatCurrency(order.grandTotal)}</span>
@@ -959,11 +1001,11 @@ const sendOrderFinalization = async (order, user) => {
             <div class="order-details">
               <h3>Shipping Information</h3>
               <p><strong>Address:</strong></p>
-              <p>${order.shippingAddress.fullName}<br>
-              ${order.shippingAddress.address}<br>
-              ${order.shippingAddress.city}, ${order.shippingAddress.state} ${order.shippingAddress.postalCode}<br>
-              ${order.shippingAddress.country}<br>
-              Phone: ${order.shippingAddress.phone}</p>
+              <p>${order.shippingAddress?.fullName || ''}<br>
+              ${order.shippingAddress?.address || ''}<br>
+              ${[order.shippingAddress?.city, order.shippingAddress?.state, order.shippingAddress?.postalCode].filter(Boolean).join(', ')}<br>
+              ${order.shippingAddress?.country || ''}<br>
+              Phone: ${order.shippingAddress?.phone || ''}</p>
               
               ${order.shipping ? `
                 <p><strong>Shipping Method:</strong> ${order.shipping.name}</p>
@@ -980,13 +1022,13 @@ const sendOrderFinalization = async (order, user) => {
             
             <div class="footer">
               <p>Your order is now finalized and will be processed for delivery. We'll keep you updated on the progress.</p>
-              <p>Thank you for choosing Barvella!</p>
+              <p>Thank you for choosing ${BRAND.NAME}!</p>
             </div>
             
             <!-- Order Details Link -->
             <div style="text-align: center; margin: 20px 0;">
               <a href="${process.env.CLIENT_URL}/profile/orders/${order.orderId}" 
-                 style="display: inline-block; background: linear-gradient(135deg, #059669 0%, #047857 100%); color: white; padding: 12px 25px; text-decoration: none; border-radius: 6px; font-weight: bold; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);">
+                 style="display: inline-block; background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); color: white; padding: 12px 25px; text-decoration: none; border-radius: 6px; font-weight: bold; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);">
                 📋 View Order Details
               </a>
             </div>
@@ -997,7 +1039,7 @@ const sendOrderFinalization = async (order, user) => {
     `;
 
     const result = await transporter.sendMail({
-      from: `"Barvella" <${process.env.EMAIL_USER}>`,
+      from: brandFrom(),
       to: user.email,
       subject: subject,
       html: html
@@ -1018,9 +1060,60 @@ const sendPOSReceipt = async (posOrder) => {
   return await sendEmail(posOrder.customer.email, 'posOrderConfirmation', { order: posOrder, user: null });
 };
 
+// Send login credentials (email + password) to a newly created user or admin
+const sendAccountCredentials = async ({ to, name, email, password, role = 'customer', loginUrl }) => {
+  const url = loginUrl || process.env.CLIENT_URL || `https://${BRAND.SITE_HOST}`;
+  const roleLabel = role === 'admin' ? 'Administrator' : 'Customer';
+  const html = `
+    <div style="font-family: Arial, Helvetica, sans-serif; max-width: 600px; margin: 0 auto; color: #1B1B1B;">
+      <div style="background: #B1123B; padding: 24px; text-align: center;">
+        <img src="${BRAND.LOGO_URL}" alt="${BRAND.NAME}" style="width: 56px; height: 56px; object-fit: contain;">
+        <h1 style="margin: 8px 0 0; font-size: 22px; letter-spacing: 4px; color: #fff;">${BRAND.NAME}</h1>
+      </div>
+      <div style="border: 1px solid #eee; border-top: none; padding: 28px 24px;">
+        <h2 style="margin: 0 0 12px; font-size: 18px;">Your ${BRAND.NAME} account is ready</h2>
+        <p style="margin: 0 0 16px; line-height: 1.6;">
+          Hi ${name || 'there'},<br/>
+          An account has been created for you as a <strong>${roleLabel}</strong>. Here are your login credentials:
+        </p>
+        <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+          <tr>
+            <td style="padding: 10px 12px; background: #f7f5f3; border: 1px solid #eee; font-size: 13px; color: #666; width: 40%;">Email</td>
+            <td style="padding: 10px 12px; border: 1px solid #eee; font-size: 14px; font-weight: bold;">${email || to}</td>
+          </tr>
+          <tr>
+            <td style="padding: 10px 12px; background: #f7f5f3; border: 1px solid #eee; font-size: 13px; color: #666;">Password</td>
+            <td style="padding: 10px 12px; border: 1px solid #eee; font-size: 14px; font-weight: bold;">${password}</td>
+          </tr>
+        </table>
+        <div style="text-align: center; margin: 20px 0;">
+          <a href="${url}"
+             style="display: inline-block; background: #B1123B; color: #fff; padding: 12px 28px; text-decoration: none; border-radius: 4px; font-weight: bold; letter-spacing: 1px;">
+            LOG IN NOW
+          </a>
+        </div>
+        <p style="font-size: 12px; color: #888; line-height: 1.6;">
+          For your security, we recommend changing your password after your first sign-in.
+        </p>
+      </div>
+      <div style="padding: 16px 24px; text-align: center; font-size: 12px; color: #888; border-top: 1px solid #eee;">
+        <p>${brandFooter()}</p>
+        <p>This is an automated email. Please do not reply to this message.</p>
+      </div>
+    </div>
+  `;
+  return await sendCustomEmail({
+    to,
+    subject: `Your ${BRAND.NAME} Account Credentials`,
+    html,
+    text: `Hi ${name || 'there'}, your ${BRAND.NAME} account is ready. Email: ${email || to} | Password: ${password}`
+  });
+};
+
 module.exports = {
   sendEmail,
   sendCustomEmail,
+  sendAccountCredentials,
   sendOrderConfirmation,
   sendOrderProcessing,
   sendOrderShipped,

@@ -16,8 +16,8 @@ exports.getOrCreateRoom = async (req, res) => {
       customerId,
       isClosed: false
     })
-    .populate('customerId', 'firstName lastName email profileImage')
-    .populate('assignedAdmin', 'firstName lastName email');
+    .populate('customerId', 'firstName lastName email imageUrl')
+    .populate('assignedAdmin', 'firstName lastName email imageUrl');
 
     if (!room) {
       room = await ChatRoom.create({ 
@@ -361,8 +361,8 @@ exports.getAllRooms = async (req, res) => {
     const adminId = req.admin._id;
 
     const rooms = await ChatRoom.find({ isClosed: false })
-      .populate('customerId', 'firstName lastName email profileImage')
-      .populate('assignedAdmin', 'firstName lastName email')
+      .populate('customerId', 'firstName lastName email imageUrl')
+      .populate('assignedAdmin', 'firstName lastName email imageUrl')
       .sort({ updatedAt: -1 }); // latest first
 
     res.json(rooms);
@@ -379,8 +379,8 @@ exports.getRoomById = async (req, res) => {
     if (!roomId) throw new BadRequestError("Room ID is required");
 
     const room = await ChatRoom.findById(roomId)
-      .populate('customerId', 'firstName lastName email profileImage')
-      .populate('assignedAdmin', 'firstName lastName email');
+      .populate('customerId', 'firstName lastName email imageUrl')
+      .populate('assignedAdmin', 'firstName lastName email imageUrl');
 
     if (!room) throw new NotFoundError("Chat room not found");
 

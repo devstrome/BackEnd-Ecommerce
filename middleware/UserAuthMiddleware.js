@@ -18,6 +18,9 @@ const authenticate = async (req, res, next) => {
 
     const user = await User.findById(decoded.userId).select('-password -refreshToken');
     if (!user) return res.status(401).json({ message: 'User not found' });
+    if (user.banned) {
+      return res.status(403).json({ message: 'This account has been banned', banned: true });
+    }
 
     // ✅ Check if token is still active (optional but recommended)
     const isTokenValid = user.accessTokens?.some(t => t.token === token && t.expiresAt > Date.now());

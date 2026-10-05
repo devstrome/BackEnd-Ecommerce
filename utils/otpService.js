@@ -10,71 +10,71 @@ const generateOTP = () => {
 const sendOTPEmail = async (email, otp, type = 'registration') => {
               const emailTemplates = {
               registration: {
-                subject: 'Email Verification - Barvella',
+                subject: 'Email Verification - BELORELLA',
                 html: `
                   <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-                    <div style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); padding: 20px; text-align: center; color: white;">
-                      <h1 style="margin: 0;">Barvella</h1>
+                    <div style="background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); padding: 20px; text-align: center; color: white;">
+                      <h1 style="margin: 0;">BELORELLA</h1>
                       <p style="margin: 5px 0;">Premium Fashion & Lifestyle</p>
                     </div>
                     
                     <div style="padding: 20px; background: #f8f9fa;">
-                      <h2 style="color: #d97706;">Email Verification</h2>
-                      <p>Thank you for registering with Barvella! Please verify your email address to complete your registration.</p>
+                      <h2 style="color: #B1123B;">Email Verification</h2>
+                      <p>Thank you for registering with BELORELLA! Please verify your email address to complete your registration.</p>
                       
                       <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; text-align: center;">
-                        <h3 style="color: #d97706; margin-top: 0;">Your Verification Code</h3>
-                        <div style="font-size: 32px; font-weight: bold; color: #d97706; letter-spacing: 8px; margin: 20px 0;">
+                        <h3 style="color: #B1123B; margin-top: 0;">Your Verification Code</h3>
+                        <div style="font-size: 32px; font-weight: bold; color: #B1123B; letter-spacing: 8px; margin: 20px 0;">
                           ${otp}
                         </div>
                         <p style="color: #666; margin: 0;">This code will expire in 10 minutes</p>
                       </div>
                       
-                      <div style="background: #fefce8; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #f59e0b;">
-                        <h4 style="color: #d97706; margin-top: 0;">Important:</h4>
-                        <ul style="color: #d97706; margin: 0;">
+                      <div style="background: #FDF2F5; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+                        <h4 style="color: #B1123B; margin-top: 0;">Important:</h4>
+                        <ul style="color: #B1123B; margin: 0;">
                           <li>Never share this code with anyone</li>
-                          <li>Barvella will never ask for this code via phone or email</li>
+                          <li>BELORELLA will never ask for this code via phone or email</li>
                           <li>If you didn't request this code, please ignore this email</li>
                         </ul>
                       </div>
                       
                       <div style="text-align: center; margin: 30px 0;">
-                        <p style="color: #d97706; font-weight: bold;">Welcome to Barvella!</p>
+                        <p style="color: #B1123B; font-weight: bold;">Welcome to BELORELLA!</p>
                       </div>
                     </div>
                     
                     <div style="background: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; color: #666;">
-                      <p>© ${new Date().getFullYear()} Barvella. All rights reserved.</p>
+                      <p>© ${new Date().getFullYear()} BELORELLA. All rights reserved.</p>
                       <p>This is an automated email. Please do not reply to this message.</p>
                     </div>
                   </div>
                 `
               },
               email_verification: {
-                subject: 'Email Verification - Barvella',
+                subject: 'Email Verification - BELORELLA',
                 html: `
                   <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-                    <div style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); padding: 20px; text-align: center; color: white;">
-                      <h1 style="margin: 0;">Barvella</h1>
+                    <div style="background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); padding: 20px; text-align: center; color: white;">
+                      <h1 style="margin: 0;">BELORELLA</h1>
                       <p style="margin: 5px 0;">Premium Fashion & Lifestyle</p>
                     </div>
                     
                     <div style="padding: 20px; background: #f8f9fa;">
-                      <h2 style="color: #d97706;">Email Verification</h2>
+                      <h2 style="color: #B1123B;">Email Verification</h2>
                       <p>Please verify your email address to complete your account setup and access all features.</p>
                       
                       <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; text-align: center;">
-                        <h3 style="color: #d97706; margin-top: 0;">Your Verification Code</h3>
-                        <div style="font-size: 32px; font-weight: bold; color: #d97706; letter-spacing: 8px; margin: 20px 0;">
+                        <h3 style="color: #B1123B; margin-top: 0;">Your Verification Code</h3>
+                        <div style="font-size: 32px; font-weight: bold; color: #B1123B; letter-spacing: 8px; margin: 20px 0;">
                           ${otp}
                         </div>
                         <p style="color: #666; margin: 0;">This code will expire in 10 minutes</p>
                       </div>
                       
-                      <div style="background: #fefce8; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #f59e0b;">
-                        <h4 style="color: #d97706; margin-top: 0;">Why verify your email?</h4>
-                        <ul style="color: #d97706; margin: 0;">
+                      <div style="background: #FDF2F5; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+                        <h4 style="color: #B1123B; margin-top: 0;">Why verify your email?</h4>
+                        <ul style="color: #B1123B; margin: 0;">
                           <li>Secure your account and protect your information</li>
                           <li>Receive important updates and notifications</li>
                           <li>Access all premium features and services</li>
@@ -83,41 +83,41 @@ const sendOTPEmail = async (email, otp, type = 'registration') => {
                       </div>
                       
                       <div style="text-align: center; margin: 30px 0;">
-                        <p style="color: #d97706; font-weight: bold;">Thank you for choosing Barvella!</p>
+                        <p style="color: #B1123B; font-weight: bold;">Thank you for choosing BELORELLA!</p>
                       </div>
                     </div>
                     
                     <div style="background: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; color: #666;">
-                      <p>© ${new Date().getFullYear()} Barvella. All rights reserved.</p>
+                      <p>© ${new Date().getFullYear()} BELORELLA. All rights reserved.</p>
                       <p>This is an automated email. Please do not reply to this message.</p>
                     </div>
                   </div>
                 `
               },
     password_reset: {
-      subject: 'Password Reset - Barvella',
+      subject: 'Password Reset - BELORELLA',
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-          <div style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); padding: 20px; text-align: center; color: white;">
-            <h1 style="margin: 0;">Barvella</h1>
+          <div style="background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); padding: 20px; text-align: center; color: white;">
+            <h1 style="margin: 0;">BELORELLA</h1>
             <p style="margin: 5px 0;">Premium Fashion & Lifestyle</p>
           </div>
           
           <div style="padding: 20px; background: #f8f9fa;">
-            <h2 style="color: #d97706;">Password Reset</h2>
+            <h2 style="color: #B1123B;">Password Reset</h2>
             <p>We received a request to reset your password. Use the code below to verify your identity.</p>
             
             <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; text-align: center;">
-              <h3 style="color: #d97706; margin-top: 0;">Your Reset Code</h3>
-              <div style="font-size: 32px; font-weight: bold; color: #d97706; letter-spacing: 8px; margin: 20px 0;">
+              <h3 style="color: #B1123B; margin-top: 0;">Your Reset Code</h3>
+              <div style="font-size: 32px; font-weight: bold; color: #B1123B; letter-spacing: 8px; margin: 20px 0;">
                 ${otp}
               </div>
               <p style="color: #666; margin: 0;">This code will expire in 10 minutes</p>
             </div>
             
-            <div style="background: #fefce8; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #f59e0b;">
-              <h4 style="color: #d97706; margin-top: 0;">Security Notice:</h4>
-              <ul style="color: #d97706; margin: 0;">
+            <div style="background: #FDF2F5; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+              <h4 style="color: #B1123B; margin-top: 0;">Security Notice:</h4>
+              <ul style="color: #B1123B; margin: 0;">
                 <li>If you didn't request this reset, please ignore this email</li>
                 <li>Your password will remain unchanged</li>
                 <li>Contact support if you have concerns</li>
@@ -126,36 +126,36 @@ const sendOTPEmail = async (email, otp, type = 'registration') => {
           </div>
           
           <div style="background: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; color: #666;">
-            <p>© ${new Date().getFullYear()} Barvella. All rights reserved.</p>
+            <p>© ${new Date().getFullYear()} BELORELLA. All rights reserved.</p>
             <p>This is an automated email. Please do not reply to this message.</p>
           </div>
         </div>
       `
     },
     email_change: {
-      subject: 'Email Update Verification - Barvella',
+      subject: 'Email Update Verification - BELORELLA',
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-          <div style="background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%); padding: 20px; text-align: center; color: white;">
-            <h1 style="margin: 0;">Barvella</h1>
+          <div style="background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); padding: 20px; text-align: center; color: white;">
+            <h1 style="margin: 0;">BELORELLA</h1>
             <p style="margin: 5px 0;">Email Update Verification</p>
           </div>
           
           <div style="padding: 20px; background: #f8f9fa;">
-            <h2 style="color: #1d4ed8;">Email Update Request</h2>
+            <h2 style="color: #B1123B;">Email Update Request</h2>
             <p>We received a request to update your email address. Use the verification code below to complete the process.</p>
             
             <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0; text-align: center;">
-              <h3 style="color: #1d4ed8; margin-top: 0;">Your Verification Code</h3>
-              <div style="font-size: 32px; font-weight: bold; color: #1d4ed8; letter-spacing: 8px; margin: 20px 0;">
+              <h3 style="color: #B1123B; margin-top: 0;">Your Verification Code</h3>
+              <div style="font-size: 32px; font-weight: bold; color: #B1123B; letter-spacing: 8px; margin: 20px 0;">
                 ${otp}
               </div>
               <p style="color: #666; margin: 0;">This code will expire in 10 minutes</p>
             </div>
             
-            <div style="background: #dbeafe; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3b82f6;">
-              <h4 style="color: #1d4ed8; margin-top: 0;">Important Information:</h4>
-              <ul style="color: #1d4ed8; margin: 0;">
+            <div style="background: #FDF2F5; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #B1123B;">
+              <h4 style="color: #8F0E2F; margin-top: 0;">Important Information:</h4>
+              <ul style="color: #8F0E2F; margin: 0;">
                 <li>If you didn't request this change, please ignore this email</li>
                 <li>For security, you'll be logged out after updating your email</li>
                 <li>Never share this code with anyone</li>
@@ -163,12 +163,12 @@ const sendOTPEmail = async (email, otp, type = 'registration') => {
             </div>
             
             <div style="text-align: center; margin: 30px 0;">
-              <p style="color: #1d4ed8; font-weight: bold;">Thank you for choosing Barvella!</p>
+              <p style="color: #B1123B; font-weight: bold;">Thank you for choosing BELORELLA!</p>
             </div>
           </div>
           
           <div style="background: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; color: #666;">
-            <p>© ${new Date().getFullYear()} Barvella. All rights reserved.</p>
+            <p>© ${new Date().getFullYear()} BELORELLA. All rights reserved.</p>
             <p>This is an automated email. Please do not reply to this message.</p>
           </div>
         </div>

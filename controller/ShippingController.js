@@ -1,8 +1,10 @@
 const Shipping = require('../models/Shipping');
+const { emitStoreEvent } = require('../utils/storeEvents');
 
 exports.create = async (req, res) => {
   try {
     const shipping = await Shipping.create(req.body);
+    emitStoreEvent('shipping_created', { shipping });
     res.status(201).json(shipping);
   } catch (err) {
     res.status(400).json({ message: err.message });
@@ -43,6 +45,7 @@ exports.update = async (req, res) => {
   try {
     const item = await Shipping.findByIdAndUpdate(req.params.id, req.body, { new: true });
     if (!item) return res.status(404).json({ message: 'Not found' });
+    emitStoreEvent('shipping_updated', { shipping: item });
     res.json(item);
   } catch (err) {
     res.status(400).json({ message: err.message });
@@ -52,6 +55,7 @@ exports.update = async (req, res) => {
 exports.remove = async (req, res) => {
   try {
     await Shipping.findByIdAndDelete(req.params.id);
+    emitStoreEvent('shipping_deleted', { shippingId: req.params.id });
     res.json({ message: 'Deleted' });
   } catch (err) {
     res.status(500).json({ message: err.message });

@@ -8,7 +8,7 @@ const {
   releaseInventoryFromOrder, 
   validateInventoryAvailability 
 } = require('../utils/inventoryHelpers');
-const { sendOrderConfirmation, sendOrderProcessing, sendOrderDelivered, sendOrderCancelled, sendOrderFinalization } = require('../utils/emailService');
+const { sendOrderConfirmation, sendOrderProcessing, sendOrderShipped, sendOrderDelivered, sendOrderCancelled, sendOrderFinalization } = require('../utils/emailService');
 
 // Socket.io instance (set from server.js)
 let ioInstance = null;
@@ -388,6 +388,7 @@ module.exports.createOrder = async (req, res) => {
       subtotal: Number(totalAmount),
       discountAmount: Number(discountAmount || 0),
       shippingCharge: orderShipping.charge,
+      shippingMethodName: orderShipping.name,
       paymentMethod: normalizedPaymentMethod,
       items: items.map(i => ({ name: i.name, quantity: Number(i.quantity) || 0 })),
     });
@@ -565,6 +566,7 @@ module.exports.adminCreateOrder = async (req, res) => {
       subtotal,
       discountAmount: Number(discountAmount) || 0,
       shippingCharge: shippingMethod.charge,
+      shippingMethodName: shippingMethod.name,
       paymentMethod: normalizedPaymentMethod,
       items: items.map(i => ({ name: i.name, quantity: Number(i.quantity) || 0 })),
     });
@@ -734,6 +736,14 @@ module.exports.updateOrderStatus = async (req, res) => {
               $set: { emailSent: 'processing' }
             });
             console.log(`✅ Processing email sent for order #${updatedOrder.orderId}`);
+          }
+        } else if (orderStatus === 'shipped' && updatedOrder.emailSent !== 'shipped') {
+          emailResult = await sendOrderShipped(updatedOrder, user);
+          if (emailResult.success) {
+            await Order.findByIdAndUpdate(updatedOrder._id, {
+              $set: { emailSent: 'shipped' }
+            });
+            console.log(`✅ Shipped email sent for order #${updatedOrder.orderId}`);
           }
         } else if (orderStatus === 'delivered' && updatedOrder.emailSent !== 'delivered') {
           emailResult = await sendOrderDelivered(updatedOrder, user);

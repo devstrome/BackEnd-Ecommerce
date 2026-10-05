@@ -1,7 +1,10 @@
 const User = require('../models/User');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const { OAuth2Client } = require('google-auth-library');
 const { createAndSendOTP, verifyOTP, incrementFailedAttempts, resendOTP } = require('../utils/otpService');
+const { sendAccountCredentials } = require('../utils/emailService');
 const Cart = require('../models/Cart'); // Added Cart model import
 
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -45,6 +48,9 @@ exports.refreshToken = async (req, res) => {
     const decoded = jwt.verify(token, JWT_REFRESH_SECRET);
     const user = await User.findById(decoded.userId);
 
+    if (user?.banned) {
+      return res.status(403).json({ message: 'This account has been banned', banned: true });
+    }
     if (!user || user.refreshToken !== token) {
       return res.status(403).json({ message: 'Invalid refresh token' });
     }
@@ -78,6 +84,9 @@ exports.sendRegistrationOTP = async (req, res) => {
 
     // Check if user already exists
     const existingUser = await User.findOne({ email: email.toLowerCase() });
+    if (existingUser?.banned) {
+      return res.status(403).json({ message: 'This account has been banned', banned: true });
+    }
     if (existingUser) {
       return res.status(400).json({ message: 'User with this email already exists' });
     }
@@ -148,6 +157,9 @@ exports.verifyOTPAndRegister = async (req, res) => {
 
     // Check if user already exists
     const existingUser = await User.findOne({ email: email.toLowerCase() });
+    if (existingUser?.banned) {
+      return res.status(403).json({ message: 'This account has been banned', banned: true });
+    }
     if (existingUser) {
       return res.status(400).json({ message: 'User with this email already exists' });
     }
@@ -187,6 +199,13 @@ exports.verifyOTPAndRegister = async (req, res) => {
         issuedAt: new Date(),
         expiresAt: new Date(Date.now() + 60 * 60 * 1000),
       }];
+
+      if (req.clientIdent) {
+        user.lastLoginIp = req.clientIdent.ip;
+        user.lastDeviceId = req.clientIdent.deviceId;
+        user.lastFingerprint = req.clientIdent.fingerprint;
+        user.lastNetwork = req.clientIdent.network;
+      }
 
       await user.save();
 
@@ -486,6 +505,9 @@ exports.register = async (req, res) => {
     }
 
     const existingUser = await User.findOne({ email });
+    if (existingUser?.banned) {
+      return res.status(403).json({ message: 'This account has been banned', banned: true });
+    }
     if (existingUser) return res.status(400).json({ message: 'User already exists' });
 
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -538,6 +560,9 @@ exports.login = async (req, res) => {
     });
 
     if (!user) return res.status(400).json({ message: 'User not found' });
+    if (user.banned) {
+      return res.status(403).json({ message: 'This account has been banned', banned: true });
+    }
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
@@ -552,12 +577,179 @@ exports.login = async (req, res) => {
       expiresAt: new Date(Date.now() + 60 * 60 * 1000),
     });
 
+    if (req.clientIdent) {
+      user.lastLoginIp = req.clientIdent.ip;
+      user.lastDeviceId = req.clientIdent.deviceId;
+      user.lastFingerprint = req.clientIdent.fingerprint;
+      user.lastNetwork = req.clientIdent.network;
+    }
+
     await user.save();
 
     res.json({ message: 'Login successful', accessToken, refreshToken, user });
   } catch (error) {
     console.error('Error logging in:', error);
     res.status(500).json({ message: 'Error logging in', error });
+  }
+};
+
+// Google Sign-In / Sign-Up: verify the Google ID token, find-or-create the user, start a session
+exports.loginWithGoogle = async (req, res) => {
+  try {
+    const { credential } = req.body;
+    if (!credential) {
+      return res.status(400).json({ message: 'Google credential is required' });
+    }
+
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    if (!clientId) {
+      return res.status(500).json({ message: 'Google sign-in is not configured (GOOGLE_CLIENT_ID missing)' });
+    }
+
+    const oauthClient = new OAuth2Client(clientId);
+    let payload;
+    try {
+      const ticket = await oauthClient.verifyIdToken({ idToken: credential, audience: clientId });
+      payload = ticket.getPayload();
+    } catch (err) {
+      console.error('Google token verification failed:', err.message);
+      return res.status(401).json({ message: 'Invalid or expired Google credential' });
+    }
+
+    if (!payload?.email || payload.email_verified === false) {
+      return res.status(400).json({ message: 'Google account email is not verified' });
+    }
+
+    const email = payload.email.toLowerCase();
+    const googleId = payload.sub;
+    const firstName = (payload.given_name || payload.name?.split(' ')[0] || 'Google').trim();
+    const lastName = (payload.family_name || payload.name?.split(' ').slice(1).join(' ') || 'User').trim();
+    const fullName = `${firstName} ${lastName}`.trim();
+    const profileImage = payload.picture || `https://ui-avatars.com/api/?name=${encodeURIComponent(fullName)}`;
+
+    // Find by googleId first, then by email (link existing local account to Google)
+    let user = await User.findOne({ googleId }) || await User.findOne({ email });
+
+    if (user?.banned) {
+      return res.status(403).json({ message: 'This account has been banned', banned: true });
+    }
+
+    if (user) {
+      // CRUD update: refresh profile details from Google on every sign-in
+      const firstGoogleLink = !user.googleId;
+      user.googleId = googleId;
+      if (firstGoogleLink) user.provider = 'google';
+      if (profileImage && user.imageUrl !== profileImage && user.imageUrl?.includes('ui-avatars.com')) {
+        user.imageUrl = profileImage;
+      }
+      if (!user.isEmailVerified) user.isEmailVerified = true;
+      await user.save();
+    } else {
+      // CRUD create: unique username from email local-part
+      const baseUserName = (email.split('@')[0] || 'user').replace(/[^a-zA-Z0-9._]/g, '').toLowerCase() || 'user';
+      let userName = baseUserName;
+      let suffix = 1;
+      while (await User.findOne({ userName })) {
+        userName = `${baseUserName}${suffix++}`;
+      }
+
+      // Random password so schema/validation stays intact; user signs in via Google
+      const randomPassword = crypto.randomBytes(24).toString('hex');
+
+      user = await User.create({
+        firstName,
+        lastName,
+        fullName,
+        email,
+        userName,
+        password: await bcrypt.hash(randomPassword, 10),
+        imageUrl: profileImage,
+        googleId,
+        provider: 'google',
+        isEmailVerified: true,
+        // Google sign-up: no real password yet -> ask the user to set one
+        mustSetPassword: true,
+      });
+    }
+
+    const { accessToken, refreshToken } = generateTokens(user._id);
+    user.refreshToken = refreshToken;
+    user.accessTokens = (user.accessTokens || []).filter(t => t.expiresAt > Date.now());
+    user.accessTokens.push({
+      token: accessToken,
+      issuedAt: new Date(),
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
+    if (req.clientIdent) {
+      user.lastLoginIp = req.clientIdent.ip;
+      user.lastDeviceId = req.clientIdent.deviceId;
+      user.lastFingerprint = req.clientIdent.fingerprint;
+      user.lastNetwork = req.clientIdent.network;
+    }
+    await user.save();
+
+    const safeUser = await User.findById(user._id).select('-password -refreshToken -accessTokens');
+    res.json({ message: 'Login successful', accessToken, refreshToken, user: safeUser });
+  } catch (error) {
+    console.error('Error logging in with Google:', error);
+    res.status(500).json({ message: 'Error logging in with Google', error: error.message });
+  }
+};
+
+// Set the first password for accounts created via Google sign-up
+// (mustSetPassword flag is cleared afterwards; email stays verified)
+exports.setInitialPassword = async (req, res) => {
+  try {
+    const { password, phoneNumber, address } = req.body;
+    if (!password || password.length < 6) {
+      return res.status(400).json({ message: 'Password must be at least 6 characters long' });
+    }
+    if (typeof phoneNumber !== 'string' || !phoneNumber.trim()) {
+      return res.status(400).json({ message: 'Phone number is required' });
+    }
+    if (address !== undefined && (!address || typeof address !== 'object' || Array.isArray(address))) {
+      return res.status(400).json({ message: 'Address must be an object' });
+    }
+    const user = await User.findById(req.user._id);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    if (user.mustSetPassword !== true) {
+      return res.status(400).json({ message: 'This account does not need an initial password' });
+    }
+
+    user.password = await bcrypt.hash(password, 10);
+    user.mustSetPassword = false;
+    if (user.provider !== 'google') user.provider = 'local';
+
+    // Also capture the contact info the Google account didn't provide
+    if (phoneNumber !== undefined) {
+      const raw = phoneNumber.trim();
+      let normalized = raw.replace(/[\s()-]/g, '');
+      if (normalized.startsWith('0')) normalized = '+880' + normalized.substring(1);
+      else if (normalized.startsWith('880')) normalized = '+' + normalized;
+      else if (!normalized.startsWith('+880')) normalized = '+880' + normalized;
+      if (!/^\+8801[3-9]\d{8}$/.test(normalized)) {
+        return res.status(400).json({ message: 'Please enter a valid Bangladeshi phone number' });
+      }
+      user.phoneNumber = normalized;
+    }
+    if (address && typeof address === 'object') {
+      const allowedFields = ['street', 'city', 'state', 'zipCode', 'country'];
+      for (const field of allowedFields) {
+        if (address[field] !== undefined) {
+          if (typeof address[field] !== 'string') {
+            return res.status(400).json({ message: `Address ${field} must be a string` });
+          }
+          user.set(`address.${field}`, address[field].trim());
+        }
+      }
+    }
+    await user.save();
+
+    const safeUser = await User.findById(user._id).select('-password -refreshToken -accessTokens');
+    res.json({ message: 'Password set successfully', user: safeUser });
+  } catch (error) {
+    res.status(500).json({ message: 'Error setting password', error: error.message });
   }
 };
 
@@ -641,7 +833,12 @@ exports.updateProfile = async (req, res) => {
       const nextLast = updatedData.lastName || req.user.lastName;
       const fullName = `${nextFirst} ${nextLast}`.trim();
       updatedData.fullName = fullName;
-      updatedData.imageUrl = `https://ui-avatars.com/api/?name=${encodeURIComponent(fullName)}`;
+      // Only regenerate the avatar placeholder if the user has never uploaded a
+      // real profile picture — don't wipe an uploaded one on a name change.
+      const existing = req.user.imageUrl || '';
+      if (!existing || existing.includes('ui-avatars.com')) {
+        updatedData.imageUrl = `https://ui-avatars.com/api/?name=${encodeURIComponent(fullName)}`;
+      }
     }
 
     const user = await User.findByIdAndUpdate(userId, updatedData, {
@@ -655,6 +852,23 @@ exports.updateProfile = async (req, res) => {
   } catch (error) {
     console.error('Error updating profile:', error);
     res.status(500).json({ message: 'Error updating profile', error });
+  }
+};
+
+// User uploads their own profile picture
+exports.uploadProfileImage = async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: 'No image file provided' });
+    const userId = req.user._id || req.user.id;
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { imageUrl: req.file.path },
+      { new: true }
+    ).select('-password -refreshToken -accessTokens');
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    res.json({ message: 'Profile image updated', user });
+  } catch (error) {
+    res.status(500).json({ message: 'Failed to upload image', error: error.message });
   }
 };
 
@@ -869,16 +1083,97 @@ exports.getUserById = async (req, res) => {
   }
 };
 
+// Create user by admin (super admin only) — user receives their credentials by email
+exports.createUserByAdmin = async (req, res) => {
+  try {
+    if (!req.admin?.superAdmin) {
+      return res.status(403).json({ message: 'Only super admin can create users' });
+    }
+
+    const { firstName, lastName, email, userName, password, phoneNumber } = req.body;
+
+    if (!firstName?.trim() || !lastName?.trim() || !email?.trim() || !userName?.trim() || !password) {
+      return res.status(400).json({ message: 'firstName, lastName, email, userName and password are required' });
+    }
+    if (String(password).length < 6) {
+      return res.status(400).json({ message: 'Password must be at least 6 characters' });
+    }
+
+    // Normalize phone to +880 format (same rules as self-registration)
+    const phoneRegex = /^(\+880|880|0)?1[3-9]\d{8}$/;
+    const trimmedPhone = (phoneNumber || '').trim();
+    if (!phoneRegex.test(trimmedPhone)) {
+      return res.status(400).json({
+        message: 'Invalid Bangladeshi phone number format. Please use format: 01XXXXXXXXX or +8801XXXXXXXXX',
+        field: 'phoneNumber',
+      });
+    }
+    let normalizedPhone = trimmedPhone;
+    if (normalizedPhone.startsWith('0')) normalizedPhone = '+880' + normalizedPhone.substring(1);
+    else if (normalizedPhone.startsWith('880')) normalizedPhone = '+' + normalizedPhone;
+    else if (!normalizedPhone.startsWith('+880')) normalizedPhone = '+880' + normalizedPhone;
+
+    const emailTrimmed = email.trim().toLowerCase();
+    const userNameTrimmed = userName.trim();
+    const existing = await User.findOne({ $or: [{ email: emailTrimmed }, { userName: userNameTrimmed }] });
+    if (existing) {
+      return res.status(400).json({ message: `${userNameTrimmed} or ${emailTrimmed} is already taken` });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const fullName = `${firstName.trim()} ${lastName.trim()}`.trim();
+    const imageUrl = req.file?.path || `https://ui-avatars.com/api/?name=${encodeURIComponent(fullName)}`;
+
+    const user = await User.create({
+      firstName: firstName.trim(),
+      lastName: lastName.trim(),
+      fullName,
+      email: emailTrimmed,
+      userName: userNameTrimmed,
+      password: hashedPassword,
+      phoneNumber: normalizedPhone,
+      imageUrl,
+      isEmailVerified: true, // created and verified by the super admin
+    });
+
+    const safeUser = await User.findById(user._id).select('-password -refreshToken -accessTokens');
+
+    // Email the new user their login credentials (non-blocking)
+    sendAccountCredentials({
+      to: emailTrimmed,
+      name: fullName,
+      email: emailTrimmed,
+      password,
+      role: 'customer',
+      loginUrl: process.env.CLIENT_URL,
+    }).catch((err) => console.error('Failed to send user credentials email:', err.message));
+
+    res.status(201).json({ message: 'User created successfully', user: safeUser });
+  } catch (error) {
+    console.error('Error creating user by admin:', error);
+    res.status(500).json({ message: 'Error creating user', error: error.message });
+  }
+};
+
 // Update user by admin (admin only)
 exports.updateUserByAdmin = async (req, res) => {
   try {
     const { userId } = req.params;
     const updatedData = { ...req.body };
 
-    // Remove sensitive fields that shouldn't be updated by admin
-    delete updatedData.password;
+    // Remove sensitive fields that shouldn't pass through verbatim
     delete updatedData.refreshToken;
     delete updatedData.accessTokens;
+
+    // Admin may set a new password when provided
+    if (typeof updatedData.password === 'string' && updatedData.password.trim()) {
+      if (updatedData.password.length < 6) {
+        return res.status(400).json({ message: 'Password must be at least 6 characters' });
+      }
+      updatedData.password = await bcrypt.hash(updatedData.password.trim(), 10);
+    } else {
+      delete updatedData.password;
+    }
 
     if (updatedData.phoneNumber) {
       // Check if phoneNumber is a valid string
@@ -936,8 +1231,14 @@ exports.updateUserByAdmin = async (req, res) => {
       const nextLast = updatedData.lastName || user.lastName;
       const fullName = `${nextFirst} ${nextLast}`.trim();
       updatedData.fullName = fullName;
-      updatedData.imageUrl = `https://ui-avatars.com/api/?name=${encodeURIComponent(fullName)}`;
+      const existing = user.imageUrl || '';
+      if (!existing || existing.includes('ui-avatars.com')) {
+        updatedData.imageUrl = `https://ui-avatars.com/api/?name=${encodeURIComponent(fullName)}`;
+      }
     }
+
+    // Admin can replace the user's profile picture
+    if (req.file?.path) updatedData.imageUrl = req.file.path;
 
     const user = await User.findByIdAndUpdate(userId, updatedData, {
       new: true,

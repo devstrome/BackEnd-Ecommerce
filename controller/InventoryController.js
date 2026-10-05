@@ -20,17 +20,57 @@ function notifyInventoryUpdate(inventory, eventType) {
   }
 }
 
+// Attach variant/color information to an inventory item (shared by list & scan endpoints)
+const enrichInventoryItem = (itemObj) => {
+  if (itemObj.productId && itemObj.productId.variants) {
+    const variant = itemObj.productId.variants.find(v => v._id.toString() === itemObj.variantId.toString());
+    if (variant) {
+      itemObj.variantId = {
+        _id: variant._id,
+        colorName: variant.colorName,
+        hexCode: variant.hexCode,
+        images: variant.images,
+        sizes: variant.sizes,
+        prices: variant.prices,
+        discountPrices: variant.discountPrices,
+        stock: variant.stock,
+        stockBySize: variant.stockBySize,
+        measureType: variant.measureType,
+        unitName: variant.unitName
+      };
+      // Add color information at the top level for easier access
+      itemObj.colorName = variant.colorName;
+      itemObj.hexCode = variant.hexCode;
+      itemObj.variantImage = variant.images?.[0]?.url;
+      // Also include the new fields from the inventory model
+      itemObj.imageUri = itemObj.imageUri || variant.images?.[0]?.url;
+      itemObj.color = itemObj.color || {
+        name: variant.colorName || 'Default',
+        hexCode: variant.hexCode || '#000000'
+      };
+    }
+  }
+  return itemObj;
+};
+exports.enrichInventoryItem = enrichInventoryItem;
+
 // Get all inventory items
 exports.getAllInventory = catchAsyncErrors(async (req, res, next) => {
-  const { page = 1, limit = 10, search = '', status = '', productId = '' } = req.query;
+  const {
+    page = 1, limit = 10, search = '', status = '', productId = '',
+    variantId = '', color = '', size = ''
+  } = req.query;
   
   const query = {};
+  const andClauses = [];
   
   if (search) {
-    query.$or = [
-      { barcode: { $regex: search, $options: 'i' } },
-      { qrCode: { $regex: search, $options: 'i' } }
-    ];
+    andClauses.push({
+      $or: [
+        { barcode: { $regex: search, $options: 'i' } },
+        { qrCode: { $regex: search, $options: 'i' } }
+      ]
+    });
   }
   
   if (status) {
@@ -39,6 +79,34 @@ exports.getAllInventory = catchAsyncErrors(async (req, res, next) => {
   
   if (productId) {
     query.productId = productId;
+  }
+
+  if (variantId) {
+    query.variantId = variantId;
+  }
+
+  if (size) {
+    query.size = size;
+  }
+
+  if (color) {
+    const escaped = color.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const colorRx = { $regex: `^${escaped}$`, $options: 'i' };
+    const colorClause = { $or: [{ 'color.name': colorRx }] };
+    // Also match items whose stored color is missing but whose variant has this color name
+    const productsWithColor = await Product.find({ 'variants.colorName': colorRx }).select('variants');
+    const colorVariantIds = [];
+    productsWithColor.forEach(p => {
+      p.variants.forEach(v => {
+        if (v.colorName && v.colorName.toLowerCase() === color.toLowerCase()) colorVariantIds.push(v._id);
+      });
+    });
+    if (colorVariantIds.length > 0) colorClause.$or.push({ variantId: { $in: colorVariantIds } });
+    andClauses.push(colorClause);
+  }
+
+  if (andClauses.length > 0) {
+    query.$and = andClauses;
   }
   
   const skip = (page - 1) * limit;
@@ -50,34 +118,7 @@ exports.getAllInventory = catchAsyncErrors(async (req, res, next) => {
     .limit(parseInt(limit));
   
   // Attach variant information to each inventory item
-  const inventoryWithVariants = inventory.map(item => {
-    const itemObj = item.toObject();
-    if (itemObj.productId && itemObj.productId.variants) {
-      const variant = itemObj.productId.variants.find(v => v._id.toString() === itemObj.variantId);
-      if (variant) {
-        itemObj.variantId = {
-          _id: variant._id,
-          colorName: variant.colorName,
-          hexCode: variant.hexCode,
-          images: variant.images,
-          sizes: variant.sizes,
-          prices: variant.prices,
-          stock: variant.stock
-        };
-        // Add color information at the top level for easier access
-        itemObj.colorName = variant.colorName;
-        itemObj.hexCode = variant.hexCode;
-        itemObj.variantImage = variant.images?.[0]?.url;
-        // Also include the new fields from the inventory model
-        itemObj.imageUri = itemObj.imageUri || variant.images?.[0]?.url;
-        itemObj.color = itemObj.color || {
-          name: variant.colorName || 'Default',
-          hexCode: variant.hexCode || '#000000'
-        };
-      }
-    }
-    return itemObj;
-  });
+  const inventoryWithVariants = inventory.map(item => enrichInventoryItem(item.toObject()));
   
   const total = await Inventory.countDocuments(query);
   
@@ -104,7 +145,7 @@ exports.getInventoryById = catchAsyncErrors(async (req, res, next) => {
   
   res.status(200).json({
     success: true,
-    inventory
+    inventory: enrichInventoryItem(inventory.toObject())
   });
 });
 
@@ -234,15 +275,29 @@ exports.deleteInventory = catchAsyncErrors(async (req, res, next) => {
 });
 
 // Scan barcode/QR code
+const PROJ = 'name mainImage mainPrice variants sku';
+
+// Resolve a scanned/typed code: exact barcode → exact qrCode → product SKU (first available unit)
+const findInventoryByCode = async (code) => {
+  const c = String(code).trim();
+  let inventory = await Inventory.findOne({ $or: [{ barcode: c }, { qrCode: c }] })
+    .populate('productId', PROJ);
+
+  if (!inventory) {
+    const escaped = c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const product = await Product.findOne({ sku: { $regex: `^${escaped}$`, $options: 'i' } }).select('_id');
+    if (product) {
+      inventory = await Inventory.findOne({ productId: product._id, availableQuantity: { $gt: 0 } })
+        .populate('productId', PROJ);
+    }
+  }
+  return inventory;
+};
+
 exports.scanCode = catchAsyncErrors(async (req, res, next) => {
   const { code } = req.body;
   
-  const inventory = await Inventory.findOne({
-    $or: [
-      { barcode: code },
-      { qrCode: code }
-    ]
-  }).populate('productId', 'name mainImage mainPrice variants');
+  const inventory = await findInventoryByCode(code);
   
   if (!inventory) {
     return next(new ErrorHandler('Code not found', 404));
@@ -250,7 +305,7 @@ exports.scanCode = catchAsyncErrors(async (req, res, next) => {
   
   res.status(200).json({
     success: true,
-    inventory
+    inventory: enrichInventoryItem(inventory.toObject())
   });
 });
 
@@ -262,12 +317,7 @@ exports.scanInventoryByCode = catchAsyncErrors(async (req, res, next) => {
     return next(new ErrorHandler('Code parameter is required', 400));
   }
   
-  const inventory = await Inventory.findOne({
-    $or: [
-      { barcode: code },
-      { qrCode: code }
-    ]
-  }).populate('productId', 'name mainImage mainPrice variants');
+  const inventory = await findInventoryByCode(code);
   
   if (!inventory) {
     return next(new ErrorHandler('Inventory item not found', 404));
@@ -275,7 +325,7 @@ exports.scanInventoryByCode = catchAsyncErrors(async (req, res, next) => {
   
   res.status(200).json({
     success: true,
-    inventory
+    inventory: enrichInventoryItem(inventory.toObject())
   });
 });
 
@@ -489,14 +539,16 @@ exports.generatePrintCodes = catchAsyncErrors(async (req, res, next) => {
     // Get variant information
     let variantInfo = null;
     if (item.productId && item.productId.variants) {
-      const variant = item.productId.variants.find(v => v._id.toString() === item.variantId);
+      const variant = item.productId.variants.find(v => v._id.toString() === item.variantId.toString());
       if (variant) {
         variantInfo = {
           colorName: variant.colorName,
           hexCode: variant.hexCode,
           images: variant.images,
           sizes: variant.sizes,
-          prices: variant.prices
+          prices: variant.prices,
+          measureType: variant.measureType,
+          unitName: variant.unitName
         };
       }
     }
@@ -508,8 +560,10 @@ exports.generatePrintCodes = catchAsyncErrors(async (req, res, next) => {
         barcode: item.barcode,
         qrCode: item.qrCode,
         productName: item.productId.name,
-        price: item.productId.mainPrice,
+        price: item.discountPrice || item.price || item.productId.mainPrice,
         size: item.size,
+        measureType: variantInfo?.measureType,
+        unitName: variantInfo?.unitName,
         stockQuantity: item.stockQuantity,
         variantInfo: variantInfo,
         colorName: variantInfo?.colorName || 'Unknown',
@@ -606,6 +660,8 @@ exports.getInventoryBatch = catchAsyncErrors(async (req, res, next) => {
 
   res.status(200).json({
     success: true,
-    inventory: inventory.length === 1 ? inventory[0] : inventory
+    inventory: inventory.length === 1
+      ? enrichInventoryItem(inventory[0].toObject())
+      : inventory.map(item => enrichInventoryItem(item.toObject()))
   });
 });

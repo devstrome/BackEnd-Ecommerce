@@ -30,6 +30,8 @@ function applyCheckoutRules(rules, input = {}) {
   const discountAmount = Number(input.discountAmount) || 0;
   const baseDelivery = Number(input.shippingCharge) || 0;
   const paymentMethod = String(input.paymentMethod || '');
+  const shippingMethodName = String(input.shippingMethodName || '');
+  const selectedFreeDelivery = /\bfree\s*(?:shipping|delivery)\b/i.test(shippingMethodName);
   const items = Array.isArray(input.items) ? input.items : [];
   const isCod = paymentMethod.toLowerCase().includes('cash');
 
@@ -93,7 +95,22 @@ function applyCheckoutRules(rules, input = {}) {
   let deliveryCharge = baseDelivery;
   let freeDelivery = false;
 
-  const freeRule = sorted.find(r => r.type === 'free_delivery_above' && orderAmount >= Number(r.value) && baseDelivery > 0);
+  const freeDeliveryRules = sorted.filter(r => r.type === 'free_delivery_above');
+  const freeRule = freeDeliveryRules.find(
+    r => orderAmount >= Number(r.value) && (baseDelivery > 0 || selectedFreeDelivery)
+  );
+
+  if (selectedFreeDelivery && freeDeliveryRules.length && !freeRule) {
+    const thresholdRule = freeDeliveryRules.reduce((lowest, rule) =>
+      Number(rule.value) < Number(lowest.value) ? rule : lowest
+    );
+    const threshold = Number(thresholdRule.value) || 0;
+    block(
+      thresholdRule,
+      `Free delivery is available on orders of ${money(threshold)} or more. Add ${money(Math.max(threshold - orderAmount, 0))} more to qualify.`
+    );
+  }
+
   if (freeRule) {
     deliveryCharge = 0;
     freeDelivery = true;

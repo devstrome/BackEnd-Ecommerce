@@ -115,7 +115,7 @@ function detectGreeting(msg) { return GREETINGS.test(msg); }
 function detectGratitude(msg) { return GRATITUDE.test(msg); }
 
 const GREETING_REPLIES = [
-  "Hey there! 👋 Welcome to Barvella. I'm your AI shopping assistant — I can help you track orders, compare products, or find something you'll love. What are you looking for today?",
+  "Hey there! 👋 Welcome to BELORELLA. I'm your AI shopping assistant — I can help you track orders, compare products, or find something you'll love. What are you looking for today?",
   "Hi! So glad you're here 😊 I can look up your orders, compare products side by side, or recommend some great finds. Just tell me what you need!",
   "Hello! Ready to help 🚀 Whether it's an order update, product comparison, or just finding the perfect item — I've got you covered. What can I do for you?",
   "Hey! Thanks for stopping by 🙌 I'm here to make your shopping experience smoother. Need to track an order? Compare two products? Or want some personalized recommendations?",
@@ -180,7 +180,7 @@ function buildSystemPrompt(ctx) {
     : 'items you might be interested in';
   const topWishlist = ctx.wishlistItems[0]?.name || 'products';
   return [
-    'You are Barvella AI — a warm, intelligent shopping assistant. Your personality is like a helpful friend who genuinely knows the user.',
+    'You are BELORELLA AI — a warm, intelligent shopping assistant. Your personality is like a helpful friend who genuinely knows the user.',
     '',
     '**About the user you are talking to:**',
     '- Name: ' + ctx.name,

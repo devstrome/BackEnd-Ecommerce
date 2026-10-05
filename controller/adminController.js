@@ -1,6 +1,7 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const Admin = require('../models/Admin');
+const { sendAccountCredentials } = require('../utils/emailService');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
@@ -150,6 +151,15 @@ exports.register = async (req, res) => {
       return res.status(500).json({ message: 'Failed to update admin session' });
     }
 
+    sendAccountCredentials({
+      to: email.trim(),
+      name: fullName,
+      email: email.trim(),
+      password,
+      role: 'admin',
+      loginUrl: process.env.ADMIN_URL || process.env.CLIENT_URL,
+    }).catch((err) => console.error('Failed to send admin credentials email:', err.message));
+
     res.status(201).json({ message: 'Admin registered successfully', accessToken, refreshToken, admin: updatedAdmin });
   } catch (error) {
     console.error('Error registering admin:', error);
@@ -203,7 +213,13 @@ exports.login = async (req, res) => {
             issuedAt: new Date(),
             expiresAt: new Date(Date.now() + 60 * 60 * 1000),
           }
-        }
+        },
+        ...(req.clientIdent ? {
+          lastLoginIp: req.clientIdent.ip,
+          lastDeviceId: req.clientIdent.deviceId,
+          lastFingerprint: req.clientIdent.fingerprint,
+          lastNetwork: req.clientIdent.network,
+        } : {}),
       },
       { new: true, runValidators: true }
     );
@@ -265,6 +281,17 @@ exports.createAdmin = async (req, res) => {
       },
       { new: true }
     );
+
+    // Email the new admin their login credentials (non-blocking)
+    const plainPassword = password.trim();
+    sendAccountCredentials({
+      to: emailTrimmed,
+      name: `${firstName} ${lastName}`.trim(),
+      email: emailTrimmed,
+      password: plainPassword,
+      role: 'admin',
+      loginUrl: process.env.ADMIN_URL || process.env.CLIENT_URL,
+    }).catch((err) => console.error('Failed to send admin credentials email:', err.message));
 
     res.status(201).json({ message: 'Admin created successfully', admin: updatedAdmin, accessToken, refreshToken });
   } catch (error) {

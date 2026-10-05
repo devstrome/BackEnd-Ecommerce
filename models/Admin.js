@@ -46,6 +46,11 @@ const adminSchema = new mongoose.Schema({
     issuedAt: { type: Date, default: Date.now },
     expiresAt: { type: Date },
   }],
+  lastLoginIp: { type: String },
+  lastDeviceId: { type: String },
+  lastFingerprint: { type: String },
+  lastNetwork: { type: String },
+  banned: { type: Boolean, default: false },
 }, { timestamps: true });
 
 module.exports = mongoose.model("Admin", adminSchema);

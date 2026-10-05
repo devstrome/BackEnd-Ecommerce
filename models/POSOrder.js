@@ -40,7 +40,9 @@ const POSOrderSchema = new mongoose.Schema({
     variantInfo: {
       size: String,
       color: String,
-      barcode: String
+      barcode: String,
+      measureType: String,
+      unitName: String
     },
     quantity: {
       type: Number,

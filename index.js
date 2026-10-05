@@ -37,6 +37,7 @@ const POSRoutes = require('./routes/POSRoutes');
 const CronRoutes = require('./routes/CronRoutes');
 const DashboardRoutes = require('./routes/DashboardRoutes');
 const PopupAdRoutes = require('./routes/popupAdRoutes');
+const PartnershipRoutes = require('./routes/PartnershipRoutes');
 const EmbeddingRoutes = require('./routes/EmbeddingRoutes');
 const SeoRoutes = require('./routes/SeoRoutes');
 const HeroSlideRoutes = require('./routes/HeroSlideRoutes');
@@ -44,6 +45,7 @@ const AnnouncementRoutes = require('./routes/AnnouncementRoutes');
 const SubscriberRoutes = require('./routes/SubscriberRoutes');
 const HelpPageRoutes = require('./routes/HelpPageRoutes');
 const BlogRoutes = require('./routes/BlogRoutes');
+const BanRoutes = require('./routes/BanRoutes');
 const { chat, history, clear } = require('./controller/AIAssistantController');
 const authenticate = require('./middleware/UserAuthMiddleware');
 
@@ -51,6 +53,7 @@ const orderController = require('./controller/OrderController');
 const inventoryController = require('./controller/InventoryController');
 const productController = require('./controller/productController');
 const cronManager = require('./utils/cronManager');
+const { setSocketIO: setStoreEventsIO } = require('./utils/storeEvents');
 
 // ==============================
 // Initialize environment & DB
@@ -73,6 +76,10 @@ app.use(cors({
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
   credentials: true,
 }));
+// Trust the first proxy hop so req.ip reflects the real client for the ban list
+app.set('trust proxy', 1);
+// Courier webhooks need the RAW body for HMAC verification -> mount BEFORE express.json()
+app.use('/api/courier/webhook', require('./routes/CourierWebhookRoutes'));
 app.use(express.json());
 
 // ==============================
@@ -101,6 +108,7 @@ app.use('/api', MeasureTypeRoutes);
 app.use('/api', ChatRoomRoutes);
 app.use('/api', ShippingRoutes);
 app.use('/api', CheckoutRuleRoutes);
+app.use('/api/courier', require('./routes/CourierRoutes'));
 app.use('/api/contact', ContactRoutes);
 app.use('/api', TopRatedSlidesRoutes);
 app.use('/api', InventoryRoutes);
@@ -108,6 +116,7 @@ app.use('/api/pos', POSRoutes);
 app.use('/api/cron', CronRoutes);
 app.use('/api/dashboard', DashboardRoutes);
 app.use('/api', PopupAdRoutes);
+app.use('/api', PartnershipRoutes);
 app.use('/api', EmbeddingRoutes);
 app.use('/api', SeoRoutes);
 app.use('/api', HeroSlideRoutes);
@@ -115,6 +124,7 @@ app.use('/api', AnnouncementRoutes);
 app.use('/api', SubscriberRoutes);
 app.use('/api', HelpPageRoutes);
 app.use('/api', BlogRoutes);
+app.use('/api', BanRoutes);
 
 // ==============================
 // Socket.IO Configuration
@@ -155,6 +165,7 @@ app.set('socketio', io);
 orderController.setSocketIO(io);
 inventoryController.setSocketIO(io);
 productController.setSocketIO(io);
+setStoreEventsIO(io);
 
 // ==============================
 // Connected users

@@ -117,6 +117,25 @@ refundBkashNumber: { type: String, default: '' },
   refundAdminNote: { type: String, default: '' },
   refundProcessedAt: { type: Date, default: null },
   isActive: { type: Boolean, default: true },
+  // Courier hand-off (two-stage: admin queues from Orders -> dispatches from
+  // the Courier page to the actual Pathao/Steadfast API)
+  courier: {
+    service: { type: String, enum: ['pathao', 'steadfast', 'manual', null], default: null },
+    status: {
+      type: String,
+      enum: ['queued', 'booked', 'picked', 'in_transit', 'delivered', 'returned', 'cancelled', 'failed', null],
+      default: null,
+    },
+    trackingNumber: { type: String, default: null },
+    consignmentId: { type: String, default: null },
+    invoice: { type: String, default: null },
+    codAmount: { type: Number, default: 0 },
+    queuedAt: { type: Date, default: null },
+    bookedAt: { type: Date, default: null },
+    cancelledAt: { type: Date, default: null },
+    lastError: { type: String, default: null },
+    lastResponse: { type: Object, default: null },
+  },
   // Email notification tracking
   emailSent: {
     type: String,

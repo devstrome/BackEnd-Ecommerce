@@ -30,7 +30,7 @@ const blogPayload = (body) => ({
   content: body.content || '',
   excerpt: body.excerpt || '',
   coverImage: body.coverImage || '',
-  author: body.author || 'Belorella',
+  author: body.author || 'BELORELLA',
   tags: normalizeTags(body.tags),
   category: body.category || 'General',
   status: body.status === 'published' ? 'published' : 'draft',

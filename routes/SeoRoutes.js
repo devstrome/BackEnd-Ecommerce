@@ -211,7 +211,7 @@ router.delete('/seo/product/:id/variant/:variantId', authenticateAdmin, async (r
 const Blog = require('../models/Blog');
 
 const buildBlogSEO = (blog) => {
-  const siteName = 'Belorella';
+  const siteName = 'BELORELLA';
   const metaTitle = (blog.title || '').slice(0, 60) + ` | ${siteName} Blog`;
   const base = (blog.excerpt || blog.content || '').replace(/<[^>]+>/g, ' ').trim();
   const metaDescription = (base || `Read "${blog.title}" on the ${siteName} blog.`).replace(/\s+/g, ' ').trim().slice(0, 160);

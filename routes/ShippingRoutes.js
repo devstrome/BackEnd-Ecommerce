@@ -3,6 +3,7 @@ const router = express.Router();
 const { create, list, listAll, get, update, remove } = require('../controller/ShippingController');
 const { authenticateAdmin } = require('../middleware/AdminAuthMiddleware');
 const DeliverySetting = require('../models/DeliverySetting');
+const { emitStoreEvent } = require('../utils/storeEvents');
 
 // Public list/get (only active shipping methods)
 router.get('/shipping', list);
@@ -28,6 +29,7 @@ router.put('/delivery-setting', authenticateAdmin, async (req, res) => {
       { phone },
       { new: true, upsert: true }
     );
+    emitStoreEvent('delivery_setting_updated', { phone: doc.phone });
     res.json({ success: true, phone: doc.phone });
   } catch (err) {
     console.error('Delivery setting update error:', err);

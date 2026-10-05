@@ -21,10 +21,10 @@ const buildReplyHtml = (contact, subject, message) => {
           ${bodyHtml}
         </div>
         <p>If you have any further questions, simply reply to this email — we are happy to help.</p>
-        <p>Best regards,<br/><strong>Belorella Support</strong></p>
+        <p>Best regards,<br/><strong>BELORELLA Support</strong></p>
       </div>
       <p style="font-size: 12px; color: #888; text-align: center; margin-top: 16px;">
-        &copy; ${new Date().getFullYear()} Belorella. All rights reserved.
+        &copy; ${new Date().getFullYear()} BELORELLA. All rights reserved.
       </p>
     </div>
   `;

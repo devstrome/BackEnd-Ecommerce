@@ -4,6 +4,8 @@ const cloudinary = require('../config/coudinaryconfig');
 const mongoose = require('mongoose');
 const Shipping = require('../models/Shipping');
 const seoService = require('../utils/seoService');
+const { revalidateCarts } = require('./CartController');
+const { emitStoreEvent } = require('../utils/storeEvents');
 
 // Normalize categories coming from multipart form data into a clean string array.
 // Handles: '["Makeup","Lip"]' (legacy JSON string), arrays with JSON-string
@@ -90,12 +92,18 @@ const addProduct = async (req, res) => {
       mainBadgeColor: req.body.mainBadgeColor,
       gender: req.body.gender,
       variants: await Promise.all(variants.map(async (variant, index) => {
-        // Build shipping options strictly from shippingIds
-        let shippingFields = {};
+        // Build shipping options strictly from shippingIds (persist the ids too
+        // so product edit can restore the previous selections)
+        let shippingFields = { shippingIds: [] };
         if (Array.isArray(variant.shippingIds) && variant.shippingIds.length > 0) {
           const ships = await Shipping.find({ _id: { $in: variant.shippingIds } });
-          const options = ships.map(s => ({ name: s.name, charge: s.charge, estimatedDays: s.estimatedDays }));
-          shippingFields = { shippingOptions: options };
+          if (ships.length > 0) {
+            const options = ships.map(s => ({ name: s.name, charge: s.charge, estimatedDays: s.estimatedDays }));
+            shippingFields = { shippingOptions: options, shippingIds: ships.map(s => s._id) };
+          }
+        } else if (Array.isArray(variant.shippingIds)) {
+          // explicit empty array = user cleared the selection
+          shippingFields = { shippingOptions: [], shippingIds: [] };
         }
 
         // Handle stockBySize array - each size has its own stock
@@ -204,8 +212,18 @@ const updateProduct = async (req, res) => {
       let shippingFields = {};
       if (Array.isArray(variant.shippingIds) && variant.shippingIds.length > 0) {
         const ships = await Shipping.find({ _id: { $in: variant.shippingIds } });
-        const options = ships.map(s => ({ name: s.name, charge: s.charge, estimatedDays: s.estimatedDays }));
-        shippingFields = { shippingOptions: options };
+        if (ships.length > 0) {
+          const options = ships.map(s => ({ name: s.name, charge: s.charge, estimatedDays: s.estimatedDays }));
+          shippingFields = { shippingOptions: options, shippingIds: ships.map(s => s._id) };
+        } else {
+          // stale ids -> keep what is already stored for this variant
+          shippingFields = {
+            shippingOptions: product.variants[index]?.shippingOptions || [],
+            shippingIds: product.variants[index]?.shippingIds || [],
+          };
+        }
+      } else if (Array.isArray(variant.shippingIds)) {
+        shippingFields = { shippingOptions: [], shippingIds: [] };
       }
 
       // Handle stockBySize array - each size has its own stock
@@ -281,7 +299,12 @@ const updateProduct = async (req, res) => {
     emitProductUpdate(product._id, 'product_updated', {
       product: product
     });
-    
+
+    // Price may have changed — re-price + re-validate open carts holding this
+    // product, then nudge all clients to re-read catalog data.
+    revalidateCarts({ productIds: [product._id] }).catch(() => {});
+    emitStoreEvent('product_updated', { productId: product._id, brand: product.brand });
+
     res.status(200).json(product);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -356,6 +379,31 @@ const getSingleProduct = async (req, res) => {
     if (!product) {
       return res.status(404).json({ error: 'Product not found' });
     }
+
+    // Legacy products (created before shippingIds were persisted): resolve ids
+    // from the stored shippingOptions so the edit form can restore selections.
+    const needsHeal = product.variants.some(v =>
+      (!v.shippingIds || v.shippingIds.length === 0) &&
+      Array.isArray(v.shippingOptions) && v.shippingOptions.length > 0
+    );
+    if (needsHeal) {
+      const allShipping = await Shipping.find({});
+      product.variants.forEach(v => {
+        if ((v.shippingIds && v.shippingIds.length > 0) || !Array.isArray(v.shippingOptions)) return;
+        const ids = v.shippingOptions.map(opt => {
+          const match = allShipping.find(s =>
+            s.name === opt.name &&
+            Number(s.charge) === Number(opt.charge) &&
+            Number(s.estimatedDays) === Number(opt.estimatedDays)
+          ) || allShipping.find(s => s.name === opt.name);
+          return match ? match._id : null;
+        }).filter(Boolean);
+        if (ids.length > 0) v.shippingIds = ids;
+      });
+      // persist the healed ids so future edits are stable
+      product.save().catch(() => {});
+    }
+
     res.status(200).json(product);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -740,6 +788,19 @@ async function generateSKUs(req, res) {
   }
 }
 
+// Top rated products for the home page (sorted by rating, then review count)
+const getTopRatedProducts = async (req, res) => {
+  try {
+    const limit = Math.min(50, parseInt(req.query.limit) || 10);
+    const products = await Product.find({ averageRating: { $gt: 0 } })
+      .sort({ averageRating: -1, totalReviews: -1 })
+      .limit(limit);
+    res.status(200).json(products);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
 // Set Socket.IO instance
 const setSocketIO = (io) => {
   ioInstance = io;
@@ -751,6 +812,7 @@ module.exports = {
   updateProduct,
   deleteProduct,
   getProducts,
+  getTopRatedProducts,
   getSingleProduct,
   deleteVariant,
   addReview,

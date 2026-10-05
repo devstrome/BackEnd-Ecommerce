@@ -14,7 +14,7 @@ const blogSchema = new Schema(
     content: { type: String, default: '' },
     excerpt: { type: String, default: '' },
     coverImage: { type: String, default: '' },
-    author: { type: String, default: 'Belorella' },
+    author: { type: String, default: 'BELORELLA' },
     tags: [{ type: String }],
     category: { type: String, default: 'General', index: true },
     status: { type: String, enum: ['draft', 'published'], default: 'draft', index: true },

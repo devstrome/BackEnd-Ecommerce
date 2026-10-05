@@ -44,6 +44,27 @@ exports.getRelatedProductsByProductId = async (req, res) => {
             return res.status(404).json({ message: 'No related products found for this product ID' });
         }
 
+        // Backfill brand/price/badge from the live product (older group records
+        // were saved without them)
+        const Product = require('../models/Product');
+        const ids = relatedProducts.flatMap(g =>
+            (g.relatedProducts || []).map(r => r.productId && r.productId._id ? r.productId._id : r.productId)
+        ).filter(Boolean);
+        const live = ids.length ? await Product.find({ _id: { $in: ids } }) : [];
+        const byId = new Map(live.map(p => [String(p._id), p]));
+        relatedProducts.forEach(group => {
+            (group.relatedProducts || []).forEach(r => {
+                const id = r.productId && r.productId._id ? r.productId._id : r.productId;
+                const p = byId.get(String(id));
+                if (!p) return;
+                if (!r.brand && p.brand) r.brand = p.brand;
+                if (p.discountPrice) r.discountPrice = p.discountPrice;
+                if (p.mainPrice != null) r.mainPrice = p.mainPrice;
+                if (p.mainBadgeName) r.mainBadgeName = p.mainBadgeName;
+                if (p.mainBadgeColor) r.mainBadgeColor = p.mainBadgeColor;
+            });
+        });
+
         // Respond with the array of related products
         res.status(200).json(relatedProducts);
     } catch (error) {

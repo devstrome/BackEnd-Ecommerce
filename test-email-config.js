@@ -38,20 +38,20 @@ async function testEmailConfig() {
     const testEmail = {
       from: process.env.EMAIL_USER,
       to: process.env.EMAIL_USER, // Send to yourself for testing
-      subject: '🧪 Barvella Email Test',
+      subject: '🧪 BELORELLA Email Test',
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-          <div style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); padding: 20px; text-align: center; color: white;">
-            <h1 style="margin: 0;">Barvella</h1>
+          <div style="background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); padding: 20px; text-align: center; color: white;">
+            <h1 style="margin: 0;">BELORELLA</h1>
             <p style="margin: 5px 0;">Premium Fashion & Lifestyle</p>
           </div>
           
           <div style="padding: 20px; background: #f8f9fa;">
-            <h2 style="color: #d97706;">Email Configuration Test</h2>
+            <h2 style="color: #B1123B;">Email Configuration Test</h2>
             <p>🎉 Congratulations! Your email configuration is working correctly.</p>
             
             <div style="background: white; padding: 15px; border-radius: 8px; margin: 20px 0;">
-              <h3 style="color: #d97706; margin-top: 0;">Test Details</h3>
+              <h3 style="color: #B1123B; margin-top: 0;">Test Details</h3>
               <p><strong>Service:</strong> ${process.env.EMAIL_SERVICE || 'gmail'}</p>
               <p><strong>From:</strong> ${process.env.EMAIL_USER}</p>
               <p><strong>Time:</strong> ${new Date().toLocaleString()}</p>
@@ -61,7 +61,7 @@ async function testEmailConfig() {
           </div>
           
           <div style="background: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; color: #666;">
-            <p>© ${new Date().getFullYear()} Barvella. All rights reserved.</p>
+            <p>© ${new Date().getFullYear()} BELORELLA. All rights reserved.</p>
           </div>
         </div>
       `

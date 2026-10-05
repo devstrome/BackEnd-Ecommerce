@@ -1,5 +1,6 @@
 const CheckoutRule = require('../models/CheckoutRule');
 const { evaluateCheckoutRules } = require('../utils/checkoutRuleEngine');
+const { emitStoreEvent } = require('../utils/storeEvents');
 
 // Public: active rules (for showing notices/promos, e.g. free delivery threshold)
 exports.listActive = async (req, res) => {
@@ -56,6 +57,7 @@ exports.create = async (req, res) => {
       isActive: !!isActive,
       priority: Number.isFinite(Number(priority)) ? Number(priority) : 10,
     });
+    emitStoreEvent('checkout_rule_created', { rule });
     res.status(201).json(rule);
   } catch (err) {
     console.error('Checkout rule create error:', err);
@@ -89,6 +91,7 @@ exports.update = async (req, res) => {
     if (priority !== undefined && Number.isFinite(Number(priority))) rule.priority = Number(priority);
 
     await rule.save();
+    emitStoreEvent('checkout_rule_updated', { rule });
     res.json(rule);
   } catch (err) {
     console.error('Checkout rule update error:', err);
@@ -101,6 +104,7 @@ exports.remove = async (req, res) => {
   try {
     const rule = await CheckoutRule.findByIdAndDelete(req.params.id);
     if (!rule) return res.status(404).json({ message: 'Rule not found' });
+    emitStoreEvent('checkout_rule_deleted', { ruleId: rule._id, name: rule.name });
     res.json({ message: 'Deleted' });
   } catch (err) {
     console.error('Checkout rule delete error:', err);
