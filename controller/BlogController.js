@@ -1,4 +1,6 @@
 const Blog = require('../models/Blog');
+const escapeRegex = require('../utils/escapeRegex');
+const { sanitizeRichHtml } = require('../utils/sanitizeHtml');
 
 const slugify = (name) =>
   String(name)
@@ -27,7 +29,7 @@ const uniqueSlug = async (title, excludeId = null) => {
 
 const blogPayload = (body) => ({
   title: body.title,
-  content: body.content || '',
+  content: sanitizeRichHtml(body.content || ''),
   excerpt: body.excerpt || '',
   coverImage: body.coverImage || '',
   author: body.author || 'BELORELLA',
@@ -42,7 +44,7 @@ const getAdminBlogs = async (req, res) => {
   try {
     const { q, status } = req.query;
     const filter = {};
-    if (q) filter.title = { $regex: String(q).trim(), $options: 'i' };
+    if (q) filter.title = { $regex: escapeRegex(String(q).trim().slice(0, 100)), $options: 'i' };
     if (status) filter.status = status;
     const blogs = await Blog.find(filter).sort({ updatedAt: -1 });
     res.status(200).json(blogs);
@@ -97,7 +99,10 @@ const getPublicBlogs = async (req, res) => {
 
     const filter = { status: 'published' };
     if (category && category !== 'All') filter.category = category;
-    if (q) filter.$or = [{ title: { $regex: String(q).trim(), $options: 'i' } }, { tags: { $regex: String(q).trim(), $options: 'i' } }];
+    if (q) {
+      const search = escapeRegex(String(q).trim().slice(0, 100));
+      filter.$or = [{ title: { $regex: search, $options: 'i' } }, { tags: { $regex: search, $options: 'i' } }];
+    }
 
     const total = await Blog.countDocuments(filter);
     const blogs = await Blog.find(filter)

@@ -14,9 +14,10 @@ const {
 } = require('../controller/contactController');
 
 const { isAuthenticatedAdmin } = require('../middleware/auth');
+const { contactLimiter } = require('../middleware/securityHardening');
 
 // Public routes
-router.post('/submit', submitContact);
+router.post('/submit', contactLimiter, submitContact);
 
 // Admin routes (protected)
 router.get('/admin/contacts', isAuthenticatedAdmin, getAllContacts);

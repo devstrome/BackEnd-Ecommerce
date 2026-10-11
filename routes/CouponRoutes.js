@@ -3,7 +3,7 @@ const Coupon = require("../controller/CouponController");
 const router = express.Router();
 
 
-const { authenticateAdmin ,requireSuperAdmin } = require("../middleware/AdminAuthMiddleware");
+const { authenticateAdmin } = require("../middleware/AdminAuthMiddleware");
 
 // Read — any authenticated admin
 router.get("/coupons",  Coupon.getAllCoupons);
@@ -13,7 +13,7 @@ router.get("/coupons/:id",  Coupon.getCouponById);
 router.post("/coupons", authenticateAdmin, Coupon.createCoupon);
 router.put("/coupons/:id", authenticateAdmin, Coupon.updateCoupon);
 
-// Delete — super admin only
-router.delete("/coupons/:id", authenticateAdmin, requireSuperAdmin, Coupon.deleteCoupon);
+// Delete — requires the Checkout Rules module permission
+router.delete("/coupons/:id", authenticateAdmin, Coupon.deleteCoupon);
 
 module.exports = router;

@@ -16,7 +16,10 @@ const authenticate = async (req, res, next) => {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
 
-    const user = await User.findById(decoded.userId).select('-password -refreshToken');
+    const user = await User.findById(decoded.userId)
+      // accessTokens must be loaded here to validate revocation. They are removed
+      // from the request payload after validation so controllers cannot expose them.
+      .select('-password -refreshToken -lastLoginIp -lastDeviceId -lastFingerprint -lastNetwork');
     if (!user) return res.status(401).json({ message: 'User not found' });
     if (user.banned) {
       return res.status(403).json({ message: 'This account has been banned', banned: true });
@@ -28,7 +31,8 @@ const authenticate = async (req, res, next) => {
       return res.status(401).json({ message: 'Access token is no longer valid or has been revoked' });
     }
 
-    req.user = user; // Attach sanitized user object to request
+    req.user = user.toObject({ virtuals: true });
+    delete req.user.accessTokens;
     next();
   } catch (err) {
     if (err.name === 'TokenExpiredError') {

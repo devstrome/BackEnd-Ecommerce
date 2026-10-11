@@ -5,19 +5,20 @@ const authenticate = require('../middleware/UserAuthMiddleware');
 const { authenticateAdmin } = require('../middleware/AdminAuthMiddleware');
 const upload = require('../config/multerconfig');
 const { checkBan } = require('../middleware/banCheck');
+const { authLimiter, otpLimiter } = require('../middleware/securityHardening');
 
 // 🔐 Public Auth Routes
-router.post('/register', checkBan, userController.register);
-router.post('/send-registration-otp', checkBan, userController.sendRegistrationOTP);
-router.post('/verify-otp-and-register', checkBan, userController.verifyOTPAndRegister);
-router.post('/resend-otp', userController.resendOTP);
-router.post('/send-email-verification-otp', userController.sendEmailVerificationOTP);
-router.post('/verify-email-with-otp', userController.verifyEmailWithOTP);
-router.post('/verify-otp', userController.verifyOTP);
-router.post('/send-forgot-password-otp', userController.sendForgotPasswordOTP);
-router.post('/verify-forgot-password-otp', userController.verifyForgotPasswordOTP);
-router.post('/login', checkBan, userController.login);
-router.post('/auth/google', checkBan, userController.loginWithGoogle); // Google Sign-In / Sign-Up
+router.post('/register', authLimiter, checkBan, userController.register);
+router.post('/send-registration-otp', otpLimiter, checkBan, userController.sendRegistrationOTP);
+router.post('/verify-otp-and-register', authLimiter, checkBan, userController.verifyOTPAndRegister);
+router.post('/resend-otp', otpLimiter, userController.resendOTP);
+router.post('/send-email-verification-otp', otpLimiter, userController.sendEmailVerificationOTP);
+router.post('/verify-email-with-otp', authLimiter, userController.verifyEmailWithOTP);
+router.post('/verify-otp', authLimiter, userController.verifyOTP);
+router.post('/send-forgot-password-otp', otpLimiter, userController.sendForgotPasswordOTP);
+router.post('/verify-forgot-password-otp', authLimiter, userController.verifyForgotPasswordOTP);
+router.post('/login', authLimiter, checkBan, userController.login);
+router.post('/auth/google', authLimiter, checkBan, userController.loginWithGoogle); // Google Sign-In / Sign-Up
 router.put('/auth/set-password', authenticate, userController.setInitialPassword); // after Google sign-up
 router.post('/refresh-token', userController.refreshToken);
 
@@ -28,7 +29,7 @@ router.patch('/address', authenticate, userController.updateAddress);
 
 // 🔐 Security Routes
 router.put('/update-password', authenticate, userController.updatePassword);
-router.post('/send-email-otp', authenticate, userController.sendEmailUpdateOTP);
+router.post('/send-email-otp', otpLimiter, authenticate, userController.sendEmailUpdateOTP);
 router.put('/update-email', authenticate, userController.updateEmail);
 
 // 💳 Payment Method Routes
@@ -45,7 +46,7 @@ router.delete('/profile', authenticate, userController.deleteUser);
  router.post('/logout', authenticate, userController.logout);
 
 // 👨‍💼 Admin Routes for User Management
-router.post('/users', authenticateAdmin, upload.single('image'), userController.createUserByAdmin); // Create user (super admin only)
+router.post('/users', authenticateAdmin, upload.single('image'), userController.createUserByAdmin); // Requires the Users module permission.
 router.get('/users', authenticateAdmin, userController.getAllUsers); // Get all users (admin only)
 router.get('/users/:userId', authenticateAdmin, userController.getUserById); // Get specific user (admin only)
 router.put('/users/:userId', authenticateAdmin, upload.single('image'), userController.updateUserByAdmin); // Update user (admin only)
@@ -99,7 +100,13 @@ router.post('/admin/wishlists/send-email', authenticateAdmin, async (req, res) =
       </div>
     `;
 
-    const result = await sendCustomEmail({ to, subject, html, text: message });
+    const result = await sendCustomEmail({
+      to,
+      subject,
+      html,
+      text: message,
+      notifySuperAdmins: true,
+    });
     if (!result.success) {
       return res.status(502).json({ message: result.message || result.error || 'Failed to send email' });
     }

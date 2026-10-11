@@ -28,12 +28,16 @@ const POSOrderSchema = new mongoose.Schema({
       ref: 'Inventory',
       required: true
     },
-    productId: {
-      type: Schema.Types.ObjectId,
-      ref: 'Product',
-      required: true
-    },
-    productName: {
+      productId: {
+        type: Schema.Types.ObjectId,
+        ref: 'Product',
+        required: true
+      },
+      sku: { type: String, default: '' },
+      productSlug: { type: String, default: '' },
+      brand: { type: String, default: '' },
+      categories: { type: [String], default: [] },
+      productName: {
       type: String,
       required: true
     },
@@ -41,8 +45,17 @@ const POSOrderSchema = new mongoose.Schema({
       size: String,
       color: String,
       barcode: String,
+      realBarcode: String,
       measureType: String,
-      unitName: String
+      unitName: String,
+      sku: String,
+      imageUrl: String,
+      qrCode: String,
+      variantId: { type: Schema.Types.ObjectId, default: null },
+      variantName: String,
+      hexCode: String,
+      regionId: { type: Schema.Types.ObjectId, ref: 'Region', default: null },
+      regionName: String
     },
     quantity: {
       type: Number,
@@ -58,6 +71,7 @@ const POSOrderSchema = new mongoose.Schema({
       type: Number,
       min: 0
     },
+    costPrice: { type: Number, min: 0, default: null },
     totalPrice: {
       type: Number,
       required: true,
@@ -87,6 +101,20 @@ const POSOrderSchema = new mongoose.Schema({
     required: true,
     min: 0
   },
+  loyaltyUserId: { type: Schema.Types.ObjectId, ref: 'User', default: null, index: true },
+  loyaltyAmountUsed: { type: Number, min: 0, default: 0 },
+  giftCodeAmountUsed: { type: Number, min: 0, default: 0 },
+  giftCodeRedemptions: [{
+    giftCodeId: { type: Schema.Types.ObjectId, ref: 'LoyaltyGiftCode', required: true },
+    codeSuffix: { type: String, required: true },
+    faceValueBDT: { type: Number, min: 0, required: true },
+    appliedBDT: { type: Number, min: 0, required: true },
+    balanceCreditedBDT: { type: Number, min: 0, default: 0 },
+    redeemedAt: { type: Date, required: true },
+  }],
+  loyaltyRewardEarned: { type: Number, min: 0, default: 0 },
+  amountDue: { type: Number, min: 0, default: 0 },
+  refundAmount: { type: Number, min: 0, default: 0 },
   paymentMethod: {
     type: String,
     enum: ['cash', 'card', 'mobile_payment', 'bank_transfer'],
@@ -94,7 +122,7 @@ const POSOrderSchema = new mongoose.Schema({
   },
   paymentStatus: {
     type: String,
-    enum: ['pending', 'completed', 'failed', 'refunded'],
+    enum: ['pending', 'completed', 'failed', 'partially_refunded', 'refunded'],
     default: 'pending'
   },
   orderStatus: {
@@ -133,6 +161,8 @@ const POSOrderSchema = new mongoose.Schema({
 }, {
   timestamps: true
 });
+
+POSOrderSchema.index({ createdAt: -1, orderStatus: 1, paymentStatus: 1 });
 
 
 

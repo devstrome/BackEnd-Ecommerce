@@ -13,8 +13,18 @@ const applicableProductSchema = new Schema({
         type: Schema.Types.ObjectId,
         required: true,
       },
+      regionId: {
+        type: Schema.Types.ObjectId,
+        ref: "Region",
+        default: null,
+      },
+      regionName: {
+        type: String,
+        default: "",
+        trim: true,
+      },
       sizes: {
-        type: [String], // Array of sizes
+        type: [String],
         required: true,
       },
       color: {
@@ -35,6 +45,18 @@ const couponSchema = new Schema(
     discount: {
       type: Number,
       required: true,
+      min: 0,
+      max: 100,
+    },
+    minCartValue: {
+      type: Number,
+      min: 0,
+      default: 0,
+    },
+    maxDiscountAmount: {
+      type: Number,
+      min: 0,
+      default: null,
     },
     expirationDate: {
       type: Date,

@@ -5,11 +5,16 @@ const RULE_TYPES = [
   'min_order',
   'max_order',
   'free_delivery_above',
+  'digital_free_delivery',
   'delivery_multiplier',
   'extra_delivery_fee',
   'handling_fee_percent',
   'cod_min',
   'cod_max',
+  'bkash_min',
+  'bkash_max',
+  'nagad_min',
+  'nagad_max',
   'max_qty_per_item',
 ];
 

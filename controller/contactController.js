@@ -1,7 +1,8 @@
 const Contact = require('../models/Contact');
 const catchAsyncErrors = require('../middleware/catchAsyncErrors');
 const ErrorHandler = require('../utils/errorHandler');
-const { sendCustomEmail } = require('../utils/emailService');
+const { sendCustomEmail, sendSuperAdminNotification } = require('../utils/emailService');
+const escapeRegex = require('../utils/escapeRegex');
 
 const escapeHtml = (s = '') => String(s).replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
@@ -47,6 +48,29 @@ exports.submitContact = catchAsyncErrors(async (req, res, next) => {
     userAgent
   });
 
+  const safeMessage = escapeHtml(message).replace(/\r?\n/g, '<br/>');
+  const notificationHtml = `
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:640px;margin:0 auto;color:#1b1b1b">
+      <div style="background:#B1123B;padding:20px;text-align:center;color:#fff">
+        <div style="font-size:22px;font-weight:700;letter-spacing:4px">BELORELLA</div>
+        <div style="font-size:12px;margin-top:5px">New contact message</div>
+      </div>
+      <div style="border:1px solid #eee;padding:24px">
+        <p><strong>From:</strong> ${escapeHtml(name)} (${escapeHtml(email)})</p>
+        <p><strong>Subject:</strong> ${escapeHtml(subject)}</p>
+        <div style="background:#f8f8f8;border-left:4px solid #B1123B;padding:16px;line-height:1.6;white-space:normal">${safeMessage}</div>
+        <p style="font-size:12px;color:#777">Contact reference: ${escapeHtml(contact._id)}</p>
+      </div>
+    </div>`;
+  const notificationResult = await sendSuperAdminNotification({
+    subject: `New contact message: ${String(subject || 'Contact form').replace(/[\r\n]/g, ' ').slice(0, 120)}`,
+    html: notificationHtml,
+    text: `New contact message from ${name} (${email})\nSubject: ${subject}\n\n${message}\n\nContact reference: ${contact._id}`,
+  });
+  if (!notificationResult.success) {
+    console.error('Contact message saved, but superadmin email notification failed:', notificationResult.message);
+  }
+
   res.status(201).json({
     success: true,
     message: 'Your message has been sent successfully! We will get back to you soon.',
@@ -72,11 +96,12 @@ exports.getAllContacts = catchAsyncErrors(async (req, res, next) => {
   }
   
   if (req.query.search) {
+    const search = escapeRegex(String(req.query.search).trim().slice(0, 100));
     filter.$or = [
-      { name: { $regex: req.query.search, $options: 'i' } },
-      { email: { $regex: req.query.search, $options: 'i' } },
-      { subject: { $regex: req.query.search, $options: 'i' } },
-      { message: { $regex: req.query.search, $options: 'i' } }
+      { name: { $regex: search, $options: 'i' } },
+      { email: { $regex: search, $options: 'i' } },
+      { subject: { $regex: search, $options: 'i' } },
+      { message: { $regex: search, $options: 'i' } }
     ];
   }
 
@@ -297,7 +322,8 @@ exports.replyToContact = catchAsyncErrors(async (req, res, next) => {
     to: contact.email,
     subject,
     html: buildReplyHtml(contact, subject, message),
-    text: message
+    text: message,
+    notifySuperAdmins: true,
   });
 
   if (!result.success) {

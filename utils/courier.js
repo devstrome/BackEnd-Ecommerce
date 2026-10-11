@@ -28,6 +28,8 @@ const SENDER_PHONE = '8801601886367';
 const senderPhone = () =>
   String(process.env.COURIER_SENDER_PHONE || SENDER_PHONE).trim();
 
+const shippableItems = (order) => (order?.items || []).filter((item) => !item?.isDigitalProduct);
+
 // ─── Pathao ─────────────────────────────────────────────────────────────
 let pathaoToken = null; // { access_token, refresh_token, expiresAt }
 
@@ -97,6 +99,8 @@ function providerError(err, provider) {
 async function pathaoCreateShipment(order) {
   const addr = order.shippingAddress || {};
   const phone = normPhone(addr.phone);
+  const items = shippableItems(order);
+  if (!items.length) throw new Error('Digital-only orders do not require courier delivery');
 
   // store_id is REQUIRED (sets the pickup location). Use PATHAO_STORE_ID or
   // resolve the merchant's default/first active store automatically.
@@ -119,11 +123,11 @@ async function pathaoCreateShipment(order) {
     recipient_address: (addr.address || addr.street || 'N/A').slice(0, 220),
     delivery_type: Number(process.env.PATHAO_DELIVERY_TYPE) || 48, // 48 normal / 12 on-demand
     item_type: 2, // 1 document / 2 parcel
-    item_quantity: Math.max(1, (order.items || []).reduce((n, i) => n + (Number(i.quantity) || 1), 0)),
+    item_quantity: Math.max(1, items.reduce((n, i) => n + (Number(i.quantity) || 1), 0)),
     item_weight: Number(process.env.PATHAO_DEFAULT_WEIGHT) || 0.5, // 0.5 - 10 kg
-    item_description: (order.items || []).map(i => i.name).filter(Boolean).join(', ').slice(0, 200) || 'Parcel',
+    item_description: items.map(i => i.name).filter(Boolean).join(', ').slice(0, 200) || 'Parcel',
     amount_to_collect: Math.round(order.paymentMethod && /cash|cod/i.test(order.paymentMethod)
-      ? Number(order.totalAmount || 0) : 0),
+      ? items.reduce((sum, item) => sum + (Number(item.price) || 0) * (Number(item.quantity) || 0), 0) : 0),
     special_instruction: order.note || undefined,
   };
   if (addr.email) payload.recipient_secondary_phone = undefined;
@@ -183,6 +187,8 @@ function steadfastHeaders() {
 async function steadfastCreateShipment(order) {
   if (!steadfastConfigured()) throw new Error('Steadfast is not configured (STEADFAST_API_KEY / STEADFAST_SECRET_KEY missing)');
   const addr = order.shippingAddress || {};
+  const items = shippableItems(order);
+  if (!items.length) throw new Error('Digital-only orders do not require courier delivery');
   const payload = {
     invoice: (order.orderId || String(order._id)).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 60) || `ORD${Date.now()}`,
     sender_phone: senderPhone(),
@@ -190,11 +196,11 @@ async function steadfastCreateShipment(order) {
     recipient_phone: normPhone(addr.phone),
     recipient_address: (addr.address || addr.street || 'N/A').slice(0, 250),
     cod_amount: order.paymentMethod && /cash|cod/i.test(order.paymentMethod)
-      ? Number(order.totalAmount || 0) : 0,
+      ? items.reduce((sum, item) => sum + (Number(item.price) || 0) * (Number(item.quantity) || 0), 0) : 0,
     note: order.note || undefined,
     recipient_email: order.email || addr.email || undefined,
-    item_description: (order.items || []).map(i => i.name).filter(Boolean).join(', ').slice(0, 200) || undefined,
-    total_lot: Math.max(1, (order.items || []).length),
+    item_description: items.map(i => i.name).filter(Boolean).join(', ').slice(0, 200) || undefined,
+    total_lot: Math.max(1, items.length),
     delivery_type: 0, // home delivery
   };
   try {

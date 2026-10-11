@@ -1,5 +1,17 @@
 const Announcement = require('../models/Announcement');
 
+// Public — active announcements in display order for the rotating top bar.
+const getActiveAnnouncements = async (req, res) => {
+  try {
+    const announcements = await Announcement.find({ active: true })
+      .sort({ createdAt: -1, _id: -1 })
+      .lean();
+    res.status(200).json(announcements);
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching announcements', error: error.message });
+  }
+};
+
 // Public — random active announcement for the top bar
 const getRandomAnnouncement = async (req, res) => {
   try {
@@ -63,6 +75,7 @@ const deleteAnnouncement = async (req, res) => {
 };
 
 module.exports = {
+  getActiveAnnouncements,
   getRandomAnnouncement,
   getAllAnnouncements,
   createAnnouncement,

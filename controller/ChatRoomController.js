@@ -1,6 +1,7 @@
 const ChatRoom = require("../models/ChatRoom");
 const { NotFoundError, BadRequestError } = require("../errors/errors");
 const mongoose = require('mongoose');
+const { customerOwnsRoom } = require('../utils/chatRoomAccess');
 
 exports.getOrCreateRoom = async (req, res) => {
   try {
@@ -11,9 +12,12 @@ exports.getOrCreateRoom = async (req, res) => {
     if (!customerId || !userId) {
       throw new BadRequestError('Customer ID and User ID are required');
     }
+    if (!customerOwnsRoom({ customerId }, userId)) {
+      throw new NotFoundError('Chat room not found');
+    }
 
     let room = await ChatRoom.findOne({
-      customerId,
+      customerId: userId,
       isClosed: false
     })
     .populate('customerId', 'firstName lastName email imageUrl')
@@ -21,9 +25,10 @@ exports.getOrCreateRoom = async (req, res) => {
 
     if (!room) {
       room = await ChatRoom.create({ 
-        customerId,
+        customerId: userId,
         messages: []
       });
+      await room.populate('customerId', 'firstName lastName fullName email imageUrl');
       
       // Notify admin room about new chat
       const io = req.app.get('socketio');
@@ -45,17 +50,33 @@ exports.getOrCreateRoom = async (req, res) => {
 exports.sendMessage = async (req, res) => {
   try {
     const { roomId } = req.params;
-    const { text } = req.body;
+    const { text = '', image = '', tempId } = req.body || {};
     const senderId = req.user?._id || req.admin?._id;
     const senderType = req.user ? "customer" : "admin";
+    const normalizedText = typeof text === 'string' ? text.trim() : '';
+    const normalizedImage = typeof image === 'string' ? image.trim() : '';
 
     // Validate input
-    if (!roomId || !text || !senderId) {
-      throw new BadRequestError('Room ID, text, and sender ID are required');
+    if (!roomId || (!normalizedText && !normalizedImage) || !senderId) {
+      throw new BadRequestError('Room ID and either message text or an image are required');
+    }
+    if (normalizedText.length > 5000 || normalizedImage.length > 2048) {
+      throw new BadRequestError('Message text or image URL exceeds the allowed size');
+    }
+    if (normalizedImage) {
+      let imageUrl;
+      try { imageUrl = new URL(normalizedImage); } catch {}
+      if (!imageUrl || imageUrl.protocol !== 'https:' || imageUrl.hostname !== 'res.cloudinary.com') {
+        throw new BadRequestError('Chat images must use the store image uploader');
+      }
     }
 
     const room = await ChatRoom.findById(roomId);
     if (!room) {
+      throw new NotFoundError('Chat room not found');
+    }
+
+    if (req.user && !customerOwnsRoom(room, req.user._id)) {
       throw new NotFoundError('Chat room not found');
     }
 
@@ -68,7 +89,9 @@ exports.sendMessage = async (req, res) => {
       _id: new mongoose.Types.ObjectId(), // Explicitly set _id
       senderId, 
       senderType, 
-      text,
+      senderName: (req.user?.fullName || [req.user?.firstName, req.user?.lastName].filter(Boolean).join(' ') || req.admin?.fullName || [req.admin?.firstName, req.admin?.lastName].filter(Boolean).join(' ') || (senderType === 'admin' ? 'BELORELLA Support' : 'Customer')).trim(),
+      text: normalizedText,
+      image: normalizedImage,
       reaction: "",
       readBy: [{
         readerType: senderType,
@@ -95,7 +118,7 @@ exports.sendMessage = async (req, res) => {
       
       // Emit message confirmation for temporary messages
       io.to(`chat_${roomId}`).emit("messageConfirmed", {
-        tempId: `temp_${Date.now()}`,
+        tempId: tempId || `temp_${Date.now()}`,
         realId: savedMessage._id,
         updates: {
           _id: savedMessage._id,
@@ -140,6 +163,7 @@ exports.autoAssignAdmin = async (req, res) => {
       _id: new mongoose.Types.ObjectId(), // Explicitly set _id
       senderId: adminId,
       senderType: "admin",
+      senderName: adminName,
       text: `Hello ${unassignedRoom.customerId.firstName || 'there'}! ${adminName} speaking, how can I help you today?`,
       reaction: "",
       readBy: [{
@@ -297,6 +321,10 @@ exports.addReaction = async (req, res) => {
       throw new NotFoundError('Chat room not found');
     }
 
+    if (req.user && !customerOwnsRoom(room, req.user._id)) {
+      throw new NotFoundError('Chat room not found');
+    }
+
     const msg = room.messages.id(messageId);
     if (!msg) {
       throw new NotFoundError('Message not found');
@@ -407,6 +435,10 @@ exports.markAsRead = async (req, res) => {
       throw new NotFoundError('Chat room not found');
     }
 
+    if (req.user && !customerOwnsRoom(room, req.user._id)) {
+      throw new NotFoundError('Chat room not found');
+    }
+
     // Mark all unread messages as read by this user type
     room.messages.forEach(message => {
       const alreadyRead = message.readBy.some(read => 
@@ -463,6 +495,11 @@ exports.updateOnlineStatus = async (req, res) => {
 
     if (!roomId || !userId) {
       throw new BadRequestError('Room ID and user ID are required');
+    }
+
+    const room = await ChatRoom.findById(roomId).select('customerId');
+    if (!room || (req.user && !customerOwnsRoom(room, req.user._id))) {
+      throw new NotFoundError('Chat room not found');
     }
 
     // Emit online status update via socket only

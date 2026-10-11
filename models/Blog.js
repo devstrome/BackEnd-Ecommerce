@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const Schema = mongoose.Schema;
+const { sanitizeRichHtml } = require('../utils/sanitizeHtml');
 
 const commentSchema = new Schema({
   user: { type: Schema.Types.ObjectId, ref: 'User', required: true },
@@ -32,10 +33,21 @@ const blogSchema = new Schema(
   },
   {
     timestamps: true,
-    toJSON: { virtuals: true },
+    toJSON: {
+      virtuals: true,
+      transform(_doc, ret) {
+        ret.content = sanitizeRichHtml(ret.content || '');
+        return ret;
+      },
+    },
     toObject: { virtuals: true },
   }
 );
+
+blogSchema.pre('validate', function sanitizeBlogContent(next) {
+  this.content = sanitizeRichHtml(this.content || '');
+  next();
+});
 
 blogSchema.virtual('likesCount').get(function () {
   return this.likes ? this.likes.length : 0;

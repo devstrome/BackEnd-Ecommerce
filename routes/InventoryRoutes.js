@@ -6,6 +6,7 @@ const {
   createInventory,
   updateInventory,
   deleteInventory,
+  deleteInventoryBulk,
   scanCode,
   scanInventoryByCode,
   getInventoryStats,
@@ -39,6 +40,9 @@ router.post('/inventory/scan', scanCode);
 
 // Create new inventory item
 router.post('/inventory', createInventory);
+
+// Bulk deletion must be registered before /inventory/:id.
+router.delete('/inventory/bulk', deleteInventoryBulk);
 
 // Update inventory item
 router.put('/inventory/:id', updateInventory);

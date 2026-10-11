@@ -1,10 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const cronManager = require('../utils/cronManager');
-const { authenticateAdmin } = require('../middleware/AdminAuthMiddleware');
+const { authenticateAdmin, requireSuperAdmin } = require('../middleware/AdminAuthMiddleware');
+
+router.use(authenticateAdmin, requireSuperAdmin);
 
 // Get cron job status (Admin only)
-router.get('/status', authenticateAdmin, (req, res) => {
+router.get('/status', (req, res) => {
   try {
     res.json({
       success: true,
@@ -21,7 +23,7 @@ router.get('/status', authenticateAdmin, (req, res) => {
 });
 
 // Start all cron jobs (Admin only)
-router.post('/start', authenticateAdmin, (req, res) => {
+router.post('/start', (req, res) => {
   try {
     cronManager.initializeCronJobs();
     res.json({

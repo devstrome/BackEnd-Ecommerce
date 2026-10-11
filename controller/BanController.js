@@ -6,7 +6,8 @@ const { clientIp, networkOf } = require('../middleware/banCheck');
 // GET /api/bans — list all bans (super admin)
 exports.listBans = async (req, res) => {
   try {
-    const bans = await Ban.find().sort({ createdAt: -1 }).lean();
+    const filter = req.admin?.superAdmin ? {} : { targetType: 'user' };
+    const bans = await Ban.find(filter).sort({ createdAt: -1 }).lean();
     res.json(bans);
   } catch (err) {
     res.status(500).json({ message: 'Failed to list bans', error: err.message });
@@ -91,6 +92,11 @@ exports.banAdmin = async (req, res) => {
 // DELETE /api/bans/:id — lift a ban
 exports.unban = async (req, res) => {
   try {
+    const existingBan = await Ban.findById(req.params.id).select('targetType');
+    if (!existingBan) return res.status(404).json({ message: 'Ban not found' });
+    if (existingBan.targetType === 'admin' && !req.admin?.superAdmin) {
+      return res.status(403).json({ message: 'Only super admin can lift an admin ban' });
+    }
     const ban = await Ban.findByIdAndDelete(req.params.id);
     if (!ban) return res.status(404).json({ message: 'Ban not found' });
 

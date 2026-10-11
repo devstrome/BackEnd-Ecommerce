@@ -2,8 +2,30 @@ const mongoose = require('mongoose');
 
 // 🔹 Individual item in the order
 const orderItemSchema = new mongoose.Schema({
-  variantId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductVariant', required: true },
+  variantId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductVariant', default: null },
   productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
+  regionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Region', default: null },
+  regionName: { type: String, default: '' },
+  productSlug: { type: String, default: '' },
+  brand: { type: String, default: '' },
+  categories: { type: [String], default: [] },
+  variantName: { type: String, default: '' },
+  variantImage: { type: String, default: '' },
+  hexCode: { type: String, default: '' },
+  barcode: { type: String, default: '' },
+  costPrice: { type: Number, min: 0, default: null },
+  originalPrice: { type: Number, min: 0 },
+  discountPrice: { type: Number, min: 0, default: null },
+  sku: { type: String, default: '' },
+  configuration: {
+    regionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Region', default: null },
+    regionName: { type: String, default: '' },
+    color: { type: String, default: '' },
+    hexCode: { type: String, default: '' },
+    size: { type: String, default: '' },
+    measureType: { type: String, default: '' },
+    unitName: { type: String, default: '' },
+  },
   discountApplied: { type: Number, default: 0 },
   name: { type: String, required: true },
   quantity: { type: Number, required: true },
@@ -13,11 +35,32 @@ const orderItemSchema = new mongoose.Schema({
   color: { type: String },
   measureType: { type: String },
   unitName: { type: String },
+  isPreOrder: { type: Boolean, default: false },
+  isDigitalProduct: { type: Boolean, default: false },
+  digitalCodeIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'DigitalProductCode' }],
+  // Manual digital credentials are encrypted at rest and only returned through
+  // authenticated order fulfillment/customer-owner endpoints.
+  manualDigitalFulfillmentEncrypted: { type: String, default: '', select: false },
+  manualDigitalFulfillmentSentAt: { type: Date, default: null },
+  preOrderEstimatedDate: { type: Date, default: null },
   // 🔹 Inventory tracking
   assignedInventoryItems: [{ 
     type: mongoose.Schema.Types.ObjectId, 
     ref: 'Inventory' 
   }], // Array of inventory item IDs assigned to this order item
+  assignedInventorySnapshots: [{
+    inventoryId: { type: mongoose.Schema.Types.ObjectId, ref: 'Inventory' },
+    costPrice: { type: Number, min: 0, default: null },
+    barcode: { type: String, default: '' },
+    realBarcode: { type: String, default: '' },
+    qrCode: { type: String, default: '' },
+    regionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Region', default: null },
+    regionName: { type: String, default: '' },
+    color: { type: String, default: '' },
+    size: { type: String, default: '' },
+    imageUri: { type: String, default: '' },
+    _id: false,
+  }],
   inventoryAssigned: { type: Boolean, default: false }, // Track if inventory has been assigned
 });
 
@@ -79,12 +122,17 @@ const orderSchema = new mongoose.Schema({
     default: [],
   },
   grandTotal: { type: Number, default: 0 },
+  amountDue: { type: Number, min: 0, default: 0 },
+  loyaltyAmountUsed: { type: Number, min: 0, default: 0 },
+  loyaltyRewardEarned: { type: Number, min: 0, default: 0 },
+  refundAmount: { type: Number, min: 0, default: 0 },
+  returnAmount: { type: Number, min: 0, default: 0 },
   couponCode: { type: String, default: null }, // Changed from couponId (ObjectId) to couponCode (String)
   couponId: { type: mongoose.Schema.Types.ObjectId, ref: 'Coupon', default: null }, // Keep both for backward compatibility
   shippingAddress: shippingAddressSchema,
   paymentMethod: {
     type: String,
-    enum: ['bKash', 'Nagad', 'Cash on Delivery', 'bkash', 'nagad', 'cash'],
+    enum: ['bKash', 'Nagad', 'Cash on Delivery', 'Loyalty Balance', 'bkash', 'nagad', 'cash', 'loyalty'],
     required: true,
   },
   selectedPaymentMethod: {
@@ -103,6 +151,9 @@ const orderSchema = new mongoose.Schema({
     enum: ['pending', 'processing', 'shipped', 'delivered', 'cancelled'],
     default: 'pending',
   },
+  // Set only on newly created orders so older records are not incorrectly
+  // presented as new when this notification behavior is enabled.
+  isNewForAdmin: { type: Boolean, default: false, index: true },
   // 🔹 Refund request workflow (user requests, admin approves/rejects)
   refundStatus: {
     type: String,
@@ -143,5 +194,7 @@ refundBkashNumber: { type: String, default: '' },
     default: null
   },
 }, { timestamps: true });
+
+orderSchema.index({ createdAt: -1, orderStatus: 1, paymentStatus: 1 });
 
 module.exports = mongoose.model('Order', orderSchema);

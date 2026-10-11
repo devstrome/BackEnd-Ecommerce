@@ -1,4 +1,5 @@
 const Inventory = require('../models/Inventory');
+const Product = require('../models/Product');
 const mongoose = require('mongoose');
 
 /**
@@ -72,42 +73,79 @@ async function assignInventoryToOrder(orderItems, orderId) {
  * @param {string} reason - Reason for release (cancelled, refunded, etc.)
  * @returns {Object} - { success: boolean, releasedItems: Array, errors: Array }
  */
-async function releaseInventoryFromOrder(orderItems, reason = 'order_cancelled') {
+async function releaseInventoryFromOrder(orderItems, reason = 'order_cancelled', existingSession = null) {
   const releasedItems = [];
   const errors = [];
-  const session = await mongoose.startSession();
+  const ownsSession = !existingSession;
+  const session = existingSession || await mongoose.startSession();
+  const processedInventoryIds = new Set();
+
+  const restore = async () => {
+    for (const item of orderItems || []) {
+      const assignedItems = item?.assignedInventoryItems || [];
+      for (const inventoryId of assignedItems) {
+        const inventoryKey = String(inventoryId?._id || inventoryId);
+        if (!inventoryKey || processedInventoryIds.has(inventoryKey)) continue;
+        processedInventoryIds.add(inventoryKey);
+
+        const inventoryItem = await Inventory.findById(inventoryKey).session(session);
+        if (!inventoryItem) {
+          errors.push(`Inventory item ${inventoryKey} not found`);
+          continue;
+        }
+
+        // A unit already released by a previous cancellation/refund should not
+        // increment product stock a second time.
+        if (Number(inventoryItem.assignedQuantity || 0) <= 0) continue;
+
+        inventoryItem.assignedQuantity = 0;
+        inventoryItem.status = 'active';
+        inventoryItem.availableQuantity = Math.max(0, Number(inventoryItem.stockQuantity || 1));
+        await inventoryItem.save({ session });
+
+        const productId = item.productId?._id || item.productId || inventoryItem.productId;
+        const variantId = item.variantId?._id || item.variantId || inventoryItem.variantId;
+        const product = await Product.findById(productId).session(session);
+        const variant = product?.variants?.id(variantId);
+        if (product && variant) {
+          const configuration = item.configuration || {};
+          const same = (left, right) => String(left || '').trim().toLowerCase() === String(right || '').trim().toLowerCase();
+          const size = configuration.size || item.size || inventoryItem.size;
+          const option = variant.options?.find(candidate =>
+            same(candidate.size, size) &&
+            same(candidate.measureType, configuration.measureType || item.measureType) &&
+            same(candidate.unitName, configuration.unitName || item.unitName)
+          );
+          const sizeIndex = (variant.sizes || []).findIndex(candidate => same(candidate, size));
+
+          if (option || sizeIndex !== -1) {
+            if (!variant.stockBySize || variant.stockBySize.length !== (variant.sizes || []).length) {
+              variant.stockBySize = new Array((variant.sizes || []).length).fill(0);
+            }
+            if (sizeIndex !== -1) variant.stockBySize[sizeIndex] = Number(variant.stockBySize[sizeIndex] || 0) + 1;
+            if (option) option.stock = Number(option.stock || 0) + 1;
+            variant.stock = variant.options?.length
+              ? variant.options.reduce((sum, entry) => sum + Number(entry.stock || 0), 0)
+              : (variant.stockBySize || []).reduce((sum, count) => sum + Number(count || 0), 0);
+            await product.save({ session });
+          }
+        }
+
+        releasedItems.push({
+          inventoryId: inventoryItem._id,
+          productId: inventoryItem.productId,
+          variantId: inventoryItem.variantId,
+          size: inventoryItem.size,
+          reason,
+        });
+      }
+    }
+    if (errors.length) throw new Error(errors.join('; '));
+  };
   
   try {
-    await session.withTransaction(async () => {
-      for (const item of orderItems) {
-        if (!item.assignedInventoryItems || item.assignedInventoryItems.length === 0) {
-          continue; // No inventory assigned to this item
-        }
-        
-        // Release each assigned inventory item
-        for (const inventoryId of item.assignedInventoryItems) {
-          const inventoryItem = await Inventory.findById(inventoryId).session(session);
-          
-          if (!inventoryItem) {
-            errors.push(`Inventory item ${inventoryId} not found`);
-            continue;
-          }
-          
-          // Reset inventory item
-          inventoryItem.assignedQuantity = 0;
-          inventoryItem.status = 'active';
-          inventoryItem.availableQuantity = 1;
-          await inventoryItem.save({ session });
-          
-          releasedItems.push({
-            inventoryId: inventoryItem._id,
-            productId: inventoryItem.productId,
-            variantId: inventoryItem.variantId,
-            size: inventoryItem.size
-          });
-        }
-      }
-    });
+    if (ownsSession) await session.withTransaction(restore);
+    else await restore();
     
     return {
       success: errors.length === 0,
@@ -118,11 +156,11 @@ async function releaseInventoryFromOrder(orderItems, reason = 'order_cancelled')
     console.error('Error releasing inventory:', error);
     return {
       success: false,
-      releasedItems: [],
-      errors: [error.message]
+      releasedItems: ownsSession ? [] : releasedItems,
+      errors: errors.length ? errors : [error.message]
     };
   } finally {
-    session.endSession();
+    if (ownsSession) session.endSession();
   }
 }
 

@@ -6,28 +6,37 @@
     "start": "node index.js",
     "dev": "nodemon index.js",
     "build": "npm install && npm rebuild",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "migrate:product-configurations": "node scripts/migrateProductConfigurations.js",
+    "test": "node --test tests/financeController.test.js tests/orderInvoicePdf.test.js tests/orderAccess.test.js tests/safeUserPayload.test.js tests/chatRoomAccess.test.js tests/escapeRegex.test.js tests/banCheck.test.js tests/cloudinaryMulterStorage.test.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "axios": "^1.11.0",
     "bcryptjs": "^2.4.3",
-    "cloudinary": "^1.41.3",
+    "bwip-js": "^4.11.4",
+    "cloudinary": "^2.11.0",
     "colors": "^1.4.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "express-async-handler": "^1.2.0",
+    "express-rate-limit": "^8.7.1",
     "google-auth-library": "^11.1.0",
+    "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.6.0",
     "multer": "^1.4.5-lts.1",
-    "multer-storage-cloudinary": "^4.0.0",
     "node-cron": "^4.2.1",
-    "nodemailer": "^7.0.5",
+    "nodemailer": "^10.0.16",
+    "pdfkit": "^0.20.2",
+    "qrcode": "^1.5.4",
+    "sanitize-html": "^2.18.0",
     "socket.io": "^4.8.0"
   }
 }

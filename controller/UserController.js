@@ -2,10 +2,12 @@ const User = require('../models/User');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const mongoose = require('mongoose');
 const { OAuth2Client } = require('google-auth-library');
 const { createAndSendOTP, verifyOTP, incrementFailedAttempts, resendOTP } = require('../utils/otpService');
-const { sendAccountCredentials } = require('../utils/emailService');
+const { sendAccountCredentials, sendUserAccountDetails } = require('../utils/emailService');
 const Cart = require('../models/Cart'); // Added Cart model import
+const { safeUserPayload } = require('../utils/safeUserPayload');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
@@ -536,7 +538,7 @@ exports.register = async (req, res) => {
 
     await user.save();
 
-    res.status(201).json({ message: 'User registered successfully', accessToken, refreshToken, user });
+    res.status(201).json({ message: 'User registered successfully', accessToken, refreshToken, user: safeUserPayload(user) });
   } catch (error) {
     console.error('Error registering user:', error);
     res.status(500).json({ message: 'Error registering user', error });
@@ -586,7 +588,7 @@ exports.login = async (req, res) => {
 
     await user.save();
 
-    res.json({ message: 'Login successful', accessToken, refreshToken, user });
+    res.json({ message: 'Login successful', accessToken, refreshToken, user: safeUserPayload(user) });
   } catch (error) {
     console.error('Error logging in:', error);
     res.status(500).json({ message: 'Error logging in', error });
@@ -688,8 +690,8 @@ exports.loginWithGoogle = async (req, res) => {
     }
     await user.save();
 
-    const safeUser = await User.findById(user._id).select('-password -refreshToken -accessTokens');
-    res.json({ message: 'Login successful', accessToken, refreshToken, user: safeUser });
+    const safeUser = await User.findById(user._id).select('-password -refreshToken -accessTokens -lastLoginIp -lastDeviceId -lastFingerprint -lastNetwork');
+    res.json({ message: 'Login successful', accessToken, refreshToken, user: safeUserPayload(safeUser) });
   } catch (error) {
     console.error('Error logging in with Google:', error);
     res.status(500).json({ message: 'Error logging in with Google', error: error.message });
@@ -746,8 +748,8 @@ exports.setInitialPassword = async (req, res) => {
     }
     await user.save();
 
-    const safeUser = await User.findById(user._id).select('-password -refreshToken -accessTokens');
-    res.json({ message: 'Password set successfully', user: safeUser });
+    const safeUser = await User.findById(user._id).select('-password -refreshToken -accessTokens -lastLoginIp -lastDeviceId -lastFingerprint -lastNetwork');
+    res.json({ message: 'Password set successfully', user: safeUserPayload(safeUser) });
   } catch (error) {
     res.status(500).json({ message: 'Error setting password', error: error.message });
   }
@@ -755,7 +757,7 @@ exports.setInitialPassword = async (req, res) => {
 
 exports.getProfile = async (req, res) => {
   try {
-    res.json(req.user);
+    res.json(safeUserPayload(req.user));
   } catch (error) {
     console.error('Error fetching profile:', error);
     res.status(500).json({ message: 'Error fetching profile', error });
@@ -765,10 +767,17 @@ exports.getProfile = async (req, res) => {
 exports.updateProfile = async (req, res) => {
   try {
     const userId = req.user._id;
-    const updatedData = { ...req.body };
-
-    delete updatedData.password;
-    delete updatedData.refreshToken;
+    // Profile edits must never change security, verification, or account-state
+    // fields (for example `banned`, `googleId`, or active access tokens).
+    const allowedFields = ['firstName', 'lastName', 'userName', 'phoneNumber'];
+    const updatedData = Object.fromEntries(
+      allowedFields
+        .filter((field) => Object.prototype.hasOwnProperty.call(req.body || {}, field))
+        .map((field) => [field, req.body[field]])
+    );
+    for (const field of ['firstName', 'lastName', 'userName']) {
+      if (typeof updatedData[field] === 'string') updatedData[field] = updatedData[field].trim();
+    }
 
     if (updatedData.phoneNumber) {
       // Check if phoneNumber is a valid string
@@ -793,22 +802,10 @@ exports.updateProfile = async (req, res) => {
       // Phone number validation - more flexible
       const phoneRegex = /^(\+880|880|0)?1[3-9]\d{8}$/;
       
-      // Debug logging
-      console.log('🔍 Phone number validation debug:');
-      console.log('  - Input phone number:', updatedData.phoneNumber);
-      console.log('  - Phone number type:', typeof updatedData.phoneNumber);
-      console.log('  - Phone number length:', updatedData.phoneNumber.length);
-      console.log('  - Regex test result:', phoneRegex.test(updatedData.phoneNumber));
-      
       if (!phoneRegex.test(updatedData.phoneNumber)) {
         return res.status(400).json({ 
           message: 'Invalid Bangladeshi phone number format. Please use format: 01XXXXXXXXX or +8801XXXXXXXXX',
-          field: 'phoneNumber',
-          debug: {
-            input: updatedData.phoneNumber,
-            length: updatedData.phoneNumber.length,
-            pattern: 'Expected: /^(\\+880|880|0)?1[3-9]\\d{8}$/'
-          }
+          field: 'phoneNumber'
         });
       }
       
@@ -844,11 +841,11 @@ exports.updateProfile = async (req, res) => {
     const user = await User.findByIdAndUpdate(userId, updatedData, {
       new: true,
       runValidators: true,
-    }).select('-password -refreshToken');
+    }).select('-password -refreshToken -accessTokens -lastLoginIp -lastDeviceId -lastFingerprint -lastNetwork');
 
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    res.json({ message: 'Profile updated successfully', user });
+    res.json({ message: 'Profile updated successfully', user: safeUserPayload(user) });
   } catch (error) {
     console.error('Error updating profile:', error);
     res.status(500).json({ message: 'Error updating profile', error });
@@ -866,7 +863,7 @@ exports.uploadProfileImage = async (req, res) => {
       { new: true }
     ).select('-password -refreshToken -accessTokens');
     if (!user) return res.status(404).json({ message: 'User not found' });
-    res.json({ message: 'Profile image updated', user });
+    res.json({ message: 'Profile image updated', user: safeUserPayload(user) });
   } catch (error) {
     res.status(500).json({ message: 'Failed to upload image', error: error.message });
   }
@@ -880,10 +877,10 @@ exports.updateAddress = async (req, res) => {
     const userId = req.user._id;
     const { address } = req.body;
 
-    const user = await User.findByIdAndUpdate(userId, { address }, { new: true }).select('-password -refreshToken');
+    const user = await User.findByIdAndUpdate(userId, { address }, { new: true }).select('-password -refreshToken -accessTokens -lastLoginIp -lastDeviceId -lastFingerprint -lastNetwork');
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    res.json({ message: 'Address updated', user });
+    res.json({ message: 'Address updated', user: safeUserPayload(user) });
   } catch (error) {
     console.error('Error updating address:', error);
     res.status(500).json({ message: 'Error updating address', error });
@@ -896,10 +893,10 @@ exports.updatePaymentMethods = async (req, res) => {
     const userId = req.user._id;
     const { paymentMethods } = req.body;
 
-    const user = await User.findByIdAndUpdate(userId, { paymentMethods }, { new: true }).select('-password -refreshToken');
+    const user = await User.findByIdAndUpdate(userId, { paymentMethods }, { new: true }).select('-password -refreshToken -accessTokens -lastLoginIp -lastDeviceId -lastFingerprint -lastNetwork');
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    res.json({ message: 'Payment methods updated', user });
+    res.json({ message: 'Payment methods updated', user: safeUserPayload(user) });
   } catch (error) {
     console.error('Error updating payment methods:', error);
     res.status(500).json({ message: 'Error updating payment methods', error });
@@ -922,7 +919,7 @@ exports.addPaymentMethod = async (req, res) => {
     user.paymentMethods.push(newMethod);
     await user.save();
 
-    res.json({ message: 'Payment method added', user });
+    res.json({ message: 'Payment method added', user: safeUserPayload(user) });
   } catch (error) {
     console.error('Error adding payment method:', error);
     res.status(500).json({ message: 'Error adding payment method', error });
@@ -941,7 +938,7 @@ exports.removePaymentMethod = async (req, res) => {
     user.paymentMethods = user.paymentMethods.filter(pm => pm._id.toString() !== methodId);
     await user.save();
 
-    res.json({ message: 'Payment method removed', user });
+    res.json({ message: 'Payment method removed', user: safeUserPayload(user) });
   } catch (error) {
     console.error('Error removing payment method:', error);
     res.status(500).json({ message: 'Error removing payment method', error });
@@ -963,7 +960,7 @@ exports.setDefaultPaymentMethod = async (req, res) => {
     }));
 
     await user.save();
-    res.json({ message: 'Default payment method set', user });
+    res.json({ message: 'Default payment method set', user: safeUserPayload(user) });
   } catch (error) {
     console.error('Error setting default payment method:', error);
     res.status(500).json({ message: 'Error setting default payment method', error });
@@ -985,7 +982,7 @@ exports.editPaymentMethod = async (req, res) => {
     Object.assign(user.paymentMethods[methodIndex], updates);
 
     await user.save();
-    res.json({ message: 'Payment method updated', user });
+    res.json({ message: 'Payment method updated', user: safeUserPayload(user) });
   } catch (error) {
     console.error('Error editing payment method:', error);
     res.status(500).json({ message: 'Error editing payment method', error });
@@ -1016,7 +1013,7 @@ exports.getAllUsers = async (req, res) => {
     
     // Fetch all users
     const users = await User.find({})
-      .select('-password -refreshToken -accessTokens')
+      .select('-password -refreshToken -accessTokens -lastLoginIp -lastDeviceId -lastFingerprint -lastNetwork')
       .lean();
 
     console.log(`📊 Found ${users.length} users`);
@@ -1069,27 +1066,23 @@ exports.getUserById = async (req, res) => {
     const { userId } = req.params;
 
     const user = await User.findById(userId)
-      .select('-password -refreshToken -accessTokens')
+      .select('-password -refreshToken -accessTokens -lastLoginIp -lastDeviceId -lastFingerprint -lastNetwork')
       .populate('paymentMethods');
 
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    res.json(user);
+    res.json(safeUserPayload(user));
   } catch (error) {
     console.error('Error fetching user by ID:', error);
     res.status(500).json({ message: 'Error fetching user', error: error.message });
   }
 };
 
-// Create user by admin (super admin only) — user receives their credentials by email
+// Create user by an admin with the Users module permission.
 exports.createUserByAdmin = async (req, res) => {
   try {
-    if (!req.admin?.superAdmin) {
-      return res.status(403).json({ message: 'Only super admin can create users' });
-    }
-
     const { firstName, lastName, email, userName, password, phoneNumber } = req.body;
 
     if (!firstName?.trim() || !lastName?.trim() || !email?.trim() || !userName?.trim() || !password) {
@@ -1133,20 +1126,22 @@ exports.createUserByAdmin = async (req, res) => {
       password: hashedPassword,
       phoneNumber: normalizedPhone,
       imageUrl,
-      isEmailVerified: true, // created and verified by the super admin
+      isEmailVerified: true, // created and verified by an authorized admin
     });
 
-    const safeUser = await User.findById(user._id).select('-password -refreshToken -accessTokens');
+    const safeUser = await User.findById(user._id).select('-password -refreshToken -accessTokens -lastLoginIp -lastDeviceId -lastFingerprint -lastNetwork');
 
-    // Email the new user their login credentials (non-blocking)
-    sendAccountCredentials({
+    // Email the new customer their login details and a profile link (non-blocking).
+    sendUserAccountDetails({
       to: emailTrimmed,
       name: fullName,
       email: emailTrimmed,
-      password,
-      role: 'customer',
-      loginUrl: process.env.CLIENT_URL,
-    }).catch((err) => console.error('Failed to send user credentials email:', err.message));
+      userName: userNameTrimmed,
+      password: String(password),
+      phoneNumber: normalizedPhone,
+      address: user.address,
+      event: 'account_created',
+    }).catch((err) => console.error('Failed to send new customer account email:', err.message));
 
     res.status(201).json({ message: 'User created successfully', user: safeUser });
   } catch (error) {
@@ -1159,18 +1154,51 @@ exports.createUserByAdmin = async (req, res) => {
 exports.updateUserByAdmin = async (req, res) => {
   try {
     const { userId } = req.params;
-    const updatedData = { ...req.body };
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: 'Invalid user ID' });
+    }
 
-    // Remove sensitive fields that shouldn't pass through verbatim
-    delete updatedData.refreshToken;
-    delete updatedData.accessTokens;
+    // Only the fields exposed by the admin profile form may be changed here.
+    // Account state, roles, verification, OAuth identifiers, and token fields
+    // are managed by their dedicated flows.
+    const allowedFields = ['firstName', 'lastName', 'email', 'userName', 'phoneNumber', 'password'];
+    const updatedData = Object.fromEntries(
+      allowedFields
+        .filter((field) => Object.prototype.hasOwnProperty.call(req.body || {}, field))
+        .map((field) => [field, req.body[field]])
+    );
+    for (const field of ['firstName', 'lastName', 'email', 'userName', 'phoneNumber', 'password']) {
+      if (updatedData[field] !== undefined && typeof updatedData[field] !== 'string') {
+        return res.status(400).json({ message: `${field} must be a string`, field });
+      }
+    }
+    for (const field of ['firstName', 'lastName', 'email', 'userName', 'phoneNumber']) {
+      if (typeof updatedData[field] === 'string') updatedData[field] = updatedData[field].trim();
+    }
 
+    const existingUser = await User.findById(userId);
+    if (!existingUser) return res.status(404).json({ message: 'User not found' });
+
+    if (updatedData.email) {
+      updatedData.email = updatedData.email.toLowerCase();
+      const duplicate = await User.exists({ _id: { $ne: userId }, email: updatedData.email });
+      if (duplicate) return res.status(409).json({ message: 'Email is already in use', field: 'email' });
+    }
+    if (updatedData.userName) {
+      const duplicate = await User.exists({ _id: { $ne: userId }, userName: updatedData.userName });
+      if (duplicate) return res.status(409).json({ message: 'Username is already in use', field: 'userName' });
+    }
+
+    // Preserve the submitted password only long enough to email it after a
+    // successful explicit admin change. It is never written to the database.
+    let passwordForAccountEmail = null;
     // Admin may set a new password when provided
     if (typeof updatedData.password === 'string' && updatedData.password.trim()) {
-      if (updatedData.password.length < 6) {
+      if (updatedData.password.trim().length < 6) {
         return res.status(400).json({ message: 'Password must be at least 6 characters' });
       }
-      updatedData.password = await bcrypt.hash(updatedData.password.trim(), 10);
+      passwordForAccountEmail = updatedData.password.trim();
+      updatedData.password = await bcrypt.hash(passwordForAccountEmail, 10);
     } else {
       delete updatedData.password;
     }
@@ -1221,18 +1249,13 @@ exports.updateUserByAdmin = async (req, res) => {
       updatedData.email = updatedData.email.toLowerCase().trim();
     }
 
-    if (updatedData.firstName || updatedData.lastName) {
-      const user = await User.findById(userId);
-      if (!user) {
-        return res.status(404).json({ message: 'User not found' });
-      }
-
-      const nextFirst = updatedData.firstName || user.firstName;
-      const nextLast = updatedData.lastName || user.lastName;
+    if (updatedData.firstName !== undefined || updatedData.lastName !== undefined) {
+      const nextFirst = updatedData.firstName ?? existingUser.firstName;
+      const nextLast = updatedData.lastName ?? existingUser.lastName;
       const fullName = `${nextFirst} ${nextLast}`.trim();
       updatedData.fullName = fullName;
-      const existing = user.imageUrl || '';
-      if (!existing || existing.includes('ui-avatars.com')) {
+      const existingImage = existingUser.imageUrl || '';
+      if (!existingImage || existingImage.includes('ui-avatars.com')) {
         updatedData.imageUrl = `https://ui-avatars.com/api/?name=${encodeURIComponent(fullName)}`;
       }
     }
@@ -1243,11 +1266,24 @@ exports.updateUserByAdmin = async (req, res) => {
     const user = await User.findByIdAndUpdate(userId, updatedData, {
       new: true,
       runValidators: true,
-    }).select('-password -refreshToken -accessTokens');
+    }).select('-password -refreshToken -accessTokens -lastLoginIp -lastDeviceId -lastFingerprint -lastNetwork');
 
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    res.json({ message: 'User updated successfully', user });
+    if (passwordForAccountEmail && user.email) {
+      sendUserAccountDetails({
+        to: user.email,
+        name: user.fullName,
+        email: user.email,
+        userName: user.userName,
+        password: passwordForAccountEmail,
+        phoneNumber: user.phoneNumber,
+        address: user.address,
+        event: 'password_updated',
+      }).catch((err) => console.error('Failed to send updated customer account email:', err.message));
+    }
+
+    res.json({ message: 'User updated successfully', user: safeUserPayload(user) });
   } catch (error) {
     console.error('Error updating user by admin:', error);
     res.status(500).json({ message: 'Error updating user', error: error.message });

@@ -1,259 +1,264 @@
-const axios = require('axios');
+const mongoose = require('mongoose');
 const Product = require('../models/Product');
+const Region = require('../models/Region');
 
-function getApiKey() { return process.env.AI_API_KEY; }
+const BRAND = 'BELORELLA';
+const MAX_TITLE_LENGTH = 60;
+const MAX_DESCRIPTION_LENGTH = 160;
 
-// ─── AI-powered SEO generation (full control) ──────────────
+const referenceId = (value) => String(value?._id || value || '');
+
+function cleanText(value) {
+  return String(value || '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function fitText(value, limit) {
+  const text = cleanText(value);
+  if (text.length <= limit) return text;
+  const cut = text.slice(0, limit + 1);
+  const lastSpace = cut.lastIndexOf(' ');
+  return (lastSpace >= Math.floor(limit * 0.6) ? cut.slice(0, lastSpace) : cut.slice(0, limit)).trim();
+}
+
+function uniqueText(values, limit = Infinity) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    const text = cleanText(value);
+    const key = text.toLocaleLowerCase();
+    if (!text || seen.has(key)) continue;
+    seen.add(key);
+    result.push(text);
+    if (result.length >= limit) break;
+  }
+  return result;
+}
+
+function getVariantOptions(variant = {}) {
+  if (Array.isArray(variant.options) && variant.options.length) return variant.options;
+  const sizes = Array.isArray(variant.sizes) ? variant.sizes : [];
+  return sizes.map((size, index) => ({
+    size,
+    measureType: variant.measureType || '',
+    unitName: variant.unitName || '',
+    price: variant.prices?.[index],
+    discountPrice: variant.discountPrices?.[index],
+  }));
+}
+
+function getOptionLabels(variant = {}) {
+  return uniqueText(getVariantOptions(variant).map((option) => {
+    const size = cleanText(option.size);
+    if (size) return size;
+    return [option.measureType, option.unitName].map(cleanText).filter(Boolean).join(' ');
+  }));
+}
+
+async function withRegionNames(product) {
+  if (!product) return product;
+  const source = typeof product.toObject === 'function' ? product.toObject() : product;
+  const variants = Array.isArray(source.variants) ? source.variants : [];
+  const refs = [source.regionId, ...(Array.isArray(source.regions) ? source.regions : []), ...variants.map((variant) => variant.regionId)].filter(Boolean);
+  const names = new Map();
+  const unresolvedIds = [];
+
+  for (const ref of refs) {
+    const id = referenceId(ref);
+    const name = typeof ref === 'object' ? (ref.name || ref.slug) : '';
+    if (id && name) names.set(id, cleanText(name));
+    else if (id && mongoose.isValidObjectId(id)) unresolvedIds.push(id);
+  }
+
+  if (unresolvedIds.length) {
+    try {
+      const regions = await Region.find({ _id: { $in: [...new Set(unresolvedIds)] } }).select('name slug').lean();
+      regions.forEach((region) => names.set(String(region._id), cleanText(region.name || region.slug)));
+    } catch (error) {
+      console.error('Could not resolve SEO region names:', error.message);
+    }
+  }
+
+  const nameFor = (ref) => names.get(referenceId(ref)) || (typeof ref === 'object' ? cleanText(ref.name || ref.slug) : '');
+  const regionName = nameFor(source.regionId) || cleanText(source.regionName);
+  const variantRegionNames = variants.map((variant) =>
+    nameFor(variant.regionId) || cleanText(variant.regionName)
+  );
+  const regionNames = uniqueText([
+    ...(Array.isArray(source.regions) ? source.regions.map(nameFor) : []),
+    regionName,
+    ...variantRegionNames,
+  ]);
+
+  return {
+    ...source,
+    regionName,
+    regionNames,
+    variants: variants.map((variant) => ({
+      ...variant,
+      regionName: nameFor(variant.regionId) || cleanText(variant.regionName) || regionNames.join(', '),
+    })),
+  };
+}
+
+function productDisplayName(product) {
+  const name = cleanText(product.name);
+  const brand = cleanText(product.brand);
+  return brand && !name.toLocaleLowerCase().includes(brand.toLocaleLowerCase())
+    ? brand + ' ' + name
+    : name;
+}
+
+function makeMetaTitle(product, variant = null) {
+  const parts = [productDisplayName(product)];
+  if (variant?.colorName) parts.push(cleanText(variant.colorName));
+  const region = cleanText(variant?.regionName || product.regionName);
+  if (region) parts.push(region);
+  const suffix = ' | ' + BRAND;
+  return fitText(parts.filter(Boolean).join(' — '), MAX_TITLE_LENGTH - suffix.length) + suffix;
+}
+
+function makeMetaDescription(product, variant = null) {
+  const name = productDisplayName(product) || 'Product';
+  const description = cleanText(variant?.description || product.description);
+  const base = description
+    ? (description.toLocaleLowerCase().includes(name.toLocaleLowerCase()) ? description : name + '. ' + description)
+    : 'Shop ' + name + ' at ' + BRAND + '.';
+  const details = [];
+
+  if (variant?.colorName) details.push('Color: ' + cleanText(variant.colorName) + '.');
+  const options = variant ? getOptionLabels(variant) : [];
+  if (options.length) details.push('Options: ' + options.slice(0, 4).join(', ') + '.');
+  const categories = Array.isArray(product.categories) ? uniqueText(product.categories.flat(Infinity), 3) : [];
+  if (categories.length) details.push('Category: ' + categories.join(' > ') + '.');
+  const regions = variant?.regionName
+    ? [cleanText(variant.regionName)]
+    : uniqueText(product.regionNames || [product.regionName], 4);
+  if (regions.length) details.push('Available in ' + regions.join(', ') + '.');
+  if (!base.toLocaleLowerCase().includes(BRAND.toLocaleLowerCase())) details.push('Shop ' + BRAND + ' Bangladesh.');
+
+  return fitText([base, ...details].join(' '), MAX_DESCRIPTION_LENGTH);
+}
+
+function makeKeywords(product, variant = null) {
+  const categories = Array.isArray(product.categories) ? product.categories.flat(Infinity) : [];
+  const variantRegions = Array.isArray(product.variants) ? product.variants.map((item) => item.regionName) : [];
+  const regions = variant?.regionName ? [variant.regionName] : [...(product.regionNames || []), ...variantRegions];
+  const variantTerms = variant
+    ? [variant.colorName, ...getOptionLabels(variant)]
+    : (Array.isArray(product.variants) ? product.variants.flatMap((item) => [item.colorName, ...getOptionLabels(item)]) : []);
+  return uniqueText([
+    product.name,
+    product.brand,
+    ...categories,
+    ...variantTerms,
+    ...regions,
+    product.gender,
+    BRAND,
+    'Bangladesh',
+  ], 16).join(', ');
+}
+
+function makeSEO(product, variant = null) {
+  return {
+    metaTitle: makeMetaTitle(product, variant),
+    metaDescription: makeMetaDescription(product, variant),
+    metaKeywords: makeKeywords(product, variant),
+    ogImage: variant?.images?.[0] || product.mainImage || product.variants?.find((item) => item.images?.[0])?.images?.[0] || '',
+    autoGenerated: true,
+    lastGenerated: new Date(),
+  };
+}
+
+function buildSEO(product) {
+  if (!product) return null;
+  return makeSEO(product);
+}
+
+function buildVariantSEO(product, variant) {
+  if (!product || !variant) return null;
+  return makeSEO(product, variant);
+}
+
 async function generateSEO(product, { force = true } = {}) {
   if (!product || !product._id) return null;
+  product = await withRegionNames(product);
 
-  // Manually-edited SEO is never overwritten unless the caller explicitly forces it
-  const isManual = !!product.seo && product.seo.autoGenerated === false;
-  if (!force && isManual) {
-    try { await generateVariantSEO(product, null, { force: false }); } catch (err) { console.error('Variant SEO failed:', err.message); }
+  if (!force && product.seo?.autoGenerated === false) {
+    await generateVariantSEO(product, null, { force: false });
     return product.seo;
   }
 
-  const apiKey = getApiKey();
-  if (!apiKey) return fallbackSEO(product, force);
-
-  const { name, brand, categories, mainPrice, discountPrice, gender, averageRating, totalReviews, description, variants } = product;
-  const catStr = Array.isArray(categories) ? categories.join(', ') : 'N/A';
-  const price = discountPrice || mainPrice || 'N/A';
-  const desc = description || (Array.isArray(variants) ? variants[0]?.description : '') || '';
-
-  const variantLines = (Array.isArray(variants) ? variants : [])
-    .map((v, i) => {
-      const prices = Array.isArray(v.prices) ? v.prices : [];
-      const discounts = Array.isArray(v.discountPrices) ? v.discountPrices.filter(x => x > 0) : [];
-      const sizes = Array.isArray(v.sizes) ? v.sizes : [];
-      return `${i + 1}. Color: ${v.colorName || 'N/A'} | sizes: ${sizes.join(', ') || 'N/A'} | prices: BDT ${prices.join('/') || 'N/A'}${discounts.length ? ` (sale: BDT ${discounts.join('/')})` : ''} | badges: ${(Array.isArray(v.badgeNames) ? v.badgeNames : []).join(', ') || 'N/A'} | image: ${Array.isArray(v.images) && v.images[0] ? 'yes' : 'no'} | description: ${(v.description || '').replace(/\s+/g, ' ').slice(0, 150) || 'N/A'}`;
-    })
-    .join('\n');
-
-  const prompt = `You are BELORELLA's head of SEO. Generate SEO metadata for the following product. You have FULL creative control — craft compelling, click-worthy meta that will rank high on Google and convert shoppers.
-
-Return ONLY a valid JSON object with these exact keys:
-- metaTitle: A compelling product title (max 70 chars, include brand and key feature, end with "| BELORELLA")
-- metaDescription: A persuasive product description (max 170 chars, include price, benefit, and call-to-action)
-- metaKeywords: A comma-separated list of 12-20 relevant keywords (include product name, brand, category, variant colors/sizes, use cases, and "BELORELLA", "Bangladesh", "buy online")
-
-Product data:
-- Name: ${name}
-- Brand: ${brand || 'N/A'}
-- Category: ${catStr}
-- Price: BDT ${price}
-- Gender: ${gender || 'Unisex'}
-- Rating: ${averageRating || 'N/A'} (${totalReviews || 0} reviews)
-- Description: ${(desc || 'N/A').slice(0, 300)}
-- Variants (color, sizes, prices, badges, description):
-${variantLines || 'N/A'}
-
-Example output format:
-{"metaTitle":"Nike Air Max 270 — BDT 12,500 | BELORELLA","metaDescription":"Shop Nike Air Max 270 at BDT 12,500. Comfortable, stylish sneakers with air cushioning. Fast delivery across Bangladesh. Order now!","metaKeywords":"nike air max 270, nike shoes, air max, buy nike Bangladesh, ..."}
-
-Rules:
-- metaTitle must be ≤70 characters
-- metaDescription must be ≤170 characters
-- Be creative and persuasive — this is marketing copy, not a data sheet
-- Include price and brand where relevant
-- Cover ALL variants — mention available colors/sizes so the meta appeals to every variant shopper
-- End metaTitle with "| BELORELLA"`;
-
-  try {
-    const res = await axios.post(
-      process.env.AI_API_URL || 'https://api.openai.com/v1/chat/completions',
-      {
-        model: process.env.AI_MODEL || 'gpt-4o-mini',
-        temperature: 0.7,
-        max_tokens: 400,
-        messages: [{ role: 'user', content: prompt }],
-      },
-      { headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, timeout: 20000 }
-    );
-    const text = res?.data?.choices?.[0]?.message?.content?.trim();
-    if (!text) return fallbackSEO(product, force);
-    const cleaned = text.replace(/```json|```/g, '').trim();
-    const json = JSON.parse(cleaned);
-    const firstVariantImage = (Array.isArray(variants) && variants[0]?.images?.[0]) || '';
-    const seo = {
-      metaTitle: String(json.metaTitle || fallbackMetaTitle(product)).slice(0, 70),
-      metaDescription: String(json.metaDescription || fallbackMetaDescription(product)).slice(0, 170),
-      metaKeywords: json.metaKeywords || fallbackMetaKeywords(product),
-      ogImage: product.mainImage || firstVariantImage || '',
-      autoGenerated: true,
-      lastGenerated: new Date(),
-    };
-    await Product.updateOne({ _id: product._id }, { $set: { seo } });
-    // Also generate SEO for each variant (uses the variant's own image/description/sizes).
-    // Manually-edited variant SEO is preserved — only the variant's own Auto-Generate button overwrites it.
-    try { await generateVariantSEO(product, null, { force: false }); } catch (err) { console.error('Variant SEO failed:', err.message); }
-    return seo;
-  } catch (err) {
-    console.error('AI SEO failed, using fallback:', err.message);
-    return fallbackSEO(product, force);
-  }
-}
-
-// ─── Emergency fallback (only when AI is unavailable) ───────
-function fallbackMetaTitle(p) {
-  return `${p.brand ? p.brand + ' ' : ''}${p.name}${p.discountPrice || p.mainPrice ? ' — BDT' + (p.discountPrice || p.mainPrice) : ''} | BELORELLA`.slice(0, 70);
-}
-function fallbackMetaDescription(p) {
-  const price = p.discountPrice || p.mainPrice;
-  return `Shop ${p.brand ? p.brand + ' ' : ''}${p.name}${price ? ' at BDT' + price : ''}. ✓ Authentic ✓ Fast delivery ✓ Easy returns. Order from BELORELLA now!`.slice(0, 170);
-}
-function fallbackMetaKeywords(p) {
-  const parts = [p.name, p.brand, ...(Array.isArray(p.categories) ? p.categories.flat().filter(Boolean) : []), p.gender, 'BELORELLA', 'buy online', 'Bangladesh'].filter(Boolean);
-  return [...new Set(parts.map(s => String(s).toLowerCase().trim()))].join(', ');
-}
-async function fallbackSEO(product, force = true) {
-  const seo = {
-    metaTitle: fallbackMetaTitle(product),
-    metaDescription: fallbackMetaDescription(product),
-    metaKeywords: fallbackMetaKeywords(product),
-    ogImage: product.mainImage || (Array.isArray(product.variants) && product.variants[0]?.images?.[0]) || '',
-    autoGenerated: true,
-    lastGenerated: new Date(),
-  };
+  const seo = buildSEO(product);
   await Product.updateOne({ _id: product._id }, { $set: { seo } });
-  try { await generateVariantSEO(product, null, { force: false }); } catch (err) { console.error('Variant SEO failed:', err.message); }
+  await generateVariantSEO(product, null, { force: false });
   return seo;
 }
 
-// ─── Per-variant SEO (each variant gets its own meta) ───────
-function variantPriceStr(v) {
-  const prices = Array.isArray(v.prices) ? v.prices.filter(x => x > 0) : [];
-  const discounts = Array.isArray(v.discountPrices) ? v.discountPrices.filter(x => x > 0) : [];
-  if (discounts.length) return `BDT ${discounts.join('/')}`;
-  if (prices.length) return `BDT ${prices.join('/')}`;
-  return '';
-}
-
-function fallbackVariantSEO(product, variant) {
-  const price = variantPriceStr(variant);
-  const title = `${product.brand ? product.brand + ' ' : ''}${product.name}${variant.colorName ? ' — ' + variant.colorName : ''} | BELORELLA`.slice(0, 70);
-  const desc = `Shop ${product.name}${variant.colorName ? ` (${variant.colorName})` : ''}${price ? ` at ${price}` : ''}. ${Array.isArray(variant.sizes) && variant.sizes.length ? `Sizes: ${variant.sizes.join(', ')}. ` : ''}Fast delivery across Bangladesh.`.slice(0, 170);
-  const parts = [product.name, variant.colorName, product.brand, ...(Array.isArray(product.categories) ? product.categories.flat() : []), ...(Array.isArray(variant.sizes) ? variant.sizes : []), product.gender, 'BELORELLA', 'buy online', 'Bangladesh'].filter(Boolean);
-  return {
-    metaTitle: title,
-    metaDescription: desc,
-    metaKeywords: [...new Set(parts.map(s => String(s).toLowerCase().trim()))].join(', '),
-    ogImage: (Array.isArray(variant.images) && variant.images[0]) || product.mainImage || '',
-    autoGenerated: true,
-    lastGenerated: new Date(),
-  };
-}
-
-async function aiVariantSEO(product, targets) {
-  const apiKey = getApiKey();
-  if (!apiKey) return null;
-
-  const catStr = Array.isArray(product.categories) ? product.categories.join(', ') : 'N/A';
-  const prompt = `You are BELORELLA's head of SEO. Generate SEO metadata for EACH variant of the product below.
-
-Return ONLY a valid JSON array with exactly ${targets.length} object(s), in the same order as the variants, each with these exact keys:
-- metaTitle (max 70 chars, includes the variant color, ends with "| BELORELLA")
-- metaDescription (max 170 chars, includes color, price/size info, call-to-action)
-- metaKeywords (comma-separated, 8-15 keywords including color name, product, "BELORELLA", "Bangladesh")
-
-Product: ${product.name}${product.brand ? ` by ${product.brand}` : ''} (${catStr}) — BDT ${product.discountPrice || product.mainPrice || 'N/A'} — ${product.gender || 'Unisex'}
-
-Variants:
-${targets.map(({ v }, k) => `${k}. Color: ${v.colorName || 'N/A'} | sizes: ${(Array.isArray(v.sizes) ? v.sizes.join(', ') : '') || 'N/A'} | prices: BDT ${(Array.isArray(v.prices) ? v.prices.join('/') : '') || 'N/A'} | sale: BDT ${(Array.isArray(v.discountPrices) ? v.discountPrices.filter(x => x > 0).join('/') : '') || 'none'} | badges: ${(Array.isArray(v.badgeNames) ? v.badgeNames.join(', ') : '') || 'N/A'} | description: ${(v.description || '').replace(/\s+/g, ' ').slice(0, 180) || 'N/A'}`).join('\n')}
-
-Example: [{"metaTitle":"Creme Allure Lipstick — Nude | BELORELLA","metaDescription":"...","metaKeywords":"nude lipstick, ..."}]
-
-Rules: metaTitle ≤70 chars, metaDescription ≤170 chars, each must be unique per color, persuasive marketing copy.`;
-
-  try {
-    const res = await axios.post(
-      process.env.AI_API_URL || 'https://api.openai.com/v1/chat/completions',
-      {
-        model: process.env.AI_MODEL || 'gpt-4o-mini',
-        temperature: 0.7,
-        max_tokens: 1200,
-        messages: [{ role: 'user', content: prompt }],
-      },
-      { headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, timeout: 25000 }
-    );
-    const text = res?.data?.choices?.[0]?.message?.content?.trim();
-    if (!text) return null;
-    const cleaned = text.replace(/```json|```/g, '').trim();
-    const arr = JSON.parse(cleaned);
-    if (!Array.isArray(arr) || arr.length !== targets.length) return null;
-    return arr.map((o, k) => ({
-      metaTitle: String(o.metaTitle || fallbackVariantSEO(product, targets[k].v).metaTitle).slice(0, 70),
-      metaDescription: String(o.metaDescription || fallbackVariantSEO(product, targets[k].v).metaDescription).slice(0, 170),
-      metaKeywords: String(o.metaKeywords || fallbackVariantSEO(product, targets[k].v).metaKeywords),
-      ogImage: (Array.isArray(targets[k].v.images) && targets[k].v.images[0]) || product.mainImage || '',
-      autoGenerated: true,
-      lastGenerated: new Date(),
-    }));
-  } catch (err) {
-    console.error('AI variant SEO failed, using fallback:', err.message);
-    return null;
-  }
-}
-
-// Generate SEO for every variant of a product (or one variant when onlyVariantId given).
-// Uses the variant's own image (images[0]), description, sizes and prices.
-// Variants with manually-edited SEO (autoGenerated === false) are skipped unless force=true.
 async function generateVariantSEO(product, onlyVariantId = null, { force = false } = {}) {
   if (!product || !product._id || !Array.isArray(product.variants) || product.variants.length === 0) return null;
+  product = await withRegionNames(product);
 
-  const targets = [];
-  product.variants.forEach((v, i) => {
-    if (onlyVariantId && String(v._id) !== String(onlyVariantId)) return;
-    if (!force && v.seo && v.seo.autoGenerated === false) return;
-    targets.push({ v, i });
-  });
-  if (targets.length === 0) return null;
+  const targets = product.variants
+    .map((variant, index) => ({ variant, index }))
+    .filter(({ variant }) => !onlyVariantId || String(variant._id) === String(onlyVariantId))
+    .filter(({ variant }) => force || variant.seo?.autoGenerated !== false);
 
-  const aiResults = await aiVariantSEO(product, targets);
+  if (!targets.length) return null;
+
   const saved = [];
-
-  for (let k = 0; k < targets.length; k++) {
-    const { v, i } = targets[k];
-    const seo = aiResults ? aiResults[k] : fallbackVariantSEO(product, v);
-    if (!seo.ogImage) seo.ogImage = (Array.isArray(v.images) && v.images[0]) || product.mainImage || '';
-    try {
-      await Product.updateOne({ _id: product._id }, { $set: { [`variants.${i}.seo`]: seo } });
-      saved.push(seo);
-    } catch (err) {
-      console.error('Failed to save variant SEO:', err.message);
-    }
+  for (const { variant, index } of targets) {
+    const seo = buildVariantSEO(product, variant);
+    await Product.updateOne({ _id: product._id }, { $set: { ['variants.' + index + '.seo']: seo } });
+    saved.push(seo);
   }
 
   return onlyVariantId ? saved[0] || null : saved;
 }
 
-// ─── Batch operations ──────────────────────────────────────
 async function generateSEOAll(batchSize = 10) {
-  const cursor = Product.find({ $or: [{ seo: { $exists: false } }, { 'seo.autoGenerated': { $ne: true } }, { 'seo.lastGenerated': null }] }).cursor();
-  let count = 0, buffer = [];
+  const cursor = Product.find({
+    $or: [
+      { 'seo.metaTitle': { $exists: false } },
+      { 'seo.metaTitle': '' },
+    ],
+  }).cursor();
+
+  let count = 0;
+  let batch = [];
   for await (const product of cursor) {
-    buffer.push(product);
-    if (buffer.length >= batchSize) {
-      await Promise.all(buffer.map(p => generateSEO(p)));
-      count += buffer.length; buffer = [];
+    batch.push(product);
+    if (batch.length >= batchSize) {
+      const results = await Promise.all(batch.map((item) => generateSEO(item, { force: false })));
+      count += results.filter(Boolean).length;
+      batch = [];
     }
   }
-  if (buffer.length > 0) { await Promise.all(buffer.map(p => generateSEO(p))); count += buffer.length; }
-  return count;
-}
 
-async function forceRegenerateAll() {
-  const products = await Product.find({}).limit(500).lean();
-  let count = 0;
-  for (const product of products) { await generateSEO(product); count++; }
+  if (batch.length) {
+    const results = await Promise.all(batch.map((item) => generateSEO(item, { force: false })));
+    count += results.filter(Boolean).length;
+  }
   return count;
 }
 
 async function getSEOStats() {
-  const total = await Product.countDocuments();
-  const withSEO = await Product.countDocuments({ seo: { $exists: true, $ne: null } });
+  const [total, withSEO] = await Promise.all([
+    Product.countDocuments(),
+    Product.countDocuments({ 'seo.metaTitle': { $exists: true, $ne: '' } }),
+  ]);
   return { total, withSEO, pending: total - withSEO };
 }
 
-module.exports = { generateSEO, generateVariantSEO, generateSEOAll, forceRegenerateAll, getSEOStats };
+module.exports = {
+  buildSEO,
+  buildVariantSEO,
+  generateSEO,
+  generateVariantSEO,
+  generateSEOAll,
+  getSEOStats,
+};

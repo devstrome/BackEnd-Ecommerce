@@ -15,15 +15,17 @@ const {
   updateStock,
   getStock,
   toggleLike,
+  getLikeStatus,
   toggleWishlist,
   getWishlist,
   purchaseBroadcast,
   generateSKUs,
+  generateProductSKU,
   getTopRatedProducts
 } = require('../controller/productController');
 
 
-const { authenticateAdmin  } = require('../middleware/AdminAuthMiddleware');
+const { authenticateAdmin } = require('../middleware/AdminAuthMiddleware');
 const authenticateUser = require('../middleware/UserAuthMiddleware');
 
 // 📥 Create product — authenticated admin
@@ -46,6 +48,7 @@ router.get('/products',  getProducts);
 // must be declared before '/products/:id'
 router.get('/products/top-rated', getTopRatedProducts);
 router.post('/products/generate-skus', authenticateAdmin, generateSKUs);
+router.post('/products/:id/generate-sku', authenticateAdmin, generateProductSKU);
 router.get('/products/:id',  getSingleProduct);
 // Reviews
 router.get('/products/:id/reviews', getReviews);
@@ -68,18 +71,19 @@ router.put(
   updateProduct
 );
 
-// 🗑️ Delete product — super admin only
+// 🗑️ Delete product — requires the Products module permission.
 router.delete('/products/:id', authenticateAdmin, deleteProduct);
 
-// 🧹 Delete variant — super admin only
-router.delete('/products/varients/:id', authenticateAdmin,  deleteVariant);
+// 🧹 Delete variant — requires the Products module permission.
+router.delete('/products/varients/:id', authenticateAdmin, deleteVariant);
 
 // 📦 Stock management routes
 router.get('/products/:id/stock', getStock);
 router.put('/products/:id/variants/:variantId/stock', authenticateAdmin, updateStock);
 
 // ❤️ Like / Love
-router.post('/products/:id/like', toggleLike);
+router.get('/products/:id/like/status', authenticateUser, getLikeStatus);
+router.post('/products/:id/like', authenticateUser, toggleLike);
 
 // ⭐ Wishlist
 router.get('/wishlist', authenticateUser, getWishlist);

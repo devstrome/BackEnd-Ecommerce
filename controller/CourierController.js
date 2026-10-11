@@ -17,6 +17,19 @@ async function findOrder(id) {
     || await Order.findOne({ 'courier.invoice': String(id) });
 }
 
+async function hydrateDigitalFlags(order) {
+  const productIds = [...new Set((order?.items || [])
+    .map((item) => String(item.productId?._id || item.productId || ''))
+    .filter(mongoose.isValidObjectId))];
+  if (!productIds.length) return order;
+  const digitalProducts = await Product.find({ _id: { $in: productIds }, isDigitalProduct: true }).select('_id').lean();
+  const digitalIds = new Set(digitalProducts.map((product) => String(product._id)));
+  for (const item of order.items || []) {
+    if (digitalIds.has(String(item.productId?._id || item.productId || ''))) item.isDigitalProduct = true;
+  }
+  return order;
+}
+
 // ─── Stage 1: admin picks a courier on the Orders page ──────────────────
 // Queues the shipment only — no external API call yet.
 exports.queueShipment = async (req, res) => {
@@ -28,8 +41,12 @@ exports.queueShipment = async (req, res) => {
     if (!PROVIDERS[service]) {
       return res.status(400).json({ success: false, message: `Unknown courier service '${service}'` });
     }
-    const order = await findOrder(orderId);
+    const order = await hydrateDigitalFlags(await findOrder(orderId));
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+
+    if (!(order.items || []).some((item) => !item.isDigitalProduct)) {
+      return res.status(400).json({ success: false, message: 'Digital-only orders are delivered online and cannot be sent to a courier' });
+    }
 
     if (order.courier?.status === 'booked') {
       return res.status(400).json({ success: false, message: 'This order is already booked with a courier' });
@@ -58,8 +75,11 @@ exports.queueShipment = async (req, res) => {
 exports.dispatchShipment = async (req, res) => {
   try {
     const { id } = req.params;
-    const order = await findOrder(id);
+    const order = await hydrateDigitalFlags(await findOrder(id));
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (!(order.items || []).some((item) => !item.isDigitalProduct)) {
+      return res.status(400).json({ success: false, message: 'Digital-only orders are delivered online and cannot be dispatched to a courier' });
+    }
 
     const service = req.body.service || order.courier?.service;
     if (!service || !PROVIDERS[service]) {
@@ -122,7 +142,17 @@ exports.listShipments = async (req, res) => {
     const { service, status } = req.query;
     const search = String(req.query.search || req.query.q || '').trim();
 
-    const filter = { 'courier.service': { $exists: true, $ne: null } };
+    const digitalProducts = await Product.find({ isDigitalProduct: true }).select('_id').lean();
+    const digitalProductIds = digitalProducts.map((product) => product._id);
+    const filter = {
+      'courier.service': { $exists: true, $ne: null },
+      items: {
+        $elemMatch: {
+          isDigitalProduct: { $ne: true },
+          productId: { $nin: digitalProductIds },
+        },
+      },
+    };
     if (service) filter['courier.service'] = service;
     if (status) filter['courier.status'] = status;
 
@@ -153,6 +183,8 @@ exports.listShipments = async (req, res) => {
       .limit(limit)
       .populate({ path: 'items.productId', select: 'name brand imageUrl' });
 
+    for (const order of orders) await hydrateDigitalFlags(order);
+
     res.json({
       orders,
       page,
@@ -168,7 +200,7 @@ exports.listShipments = async (req, res) => {
 exports.trackShipment = async (req, res) => {
   try {
     const { id } = req.params;
-    const order = await findOrder(id);
+    const order = await hydrateDigitalFlags(await findOrder(id));
     if (!order) return res.status(404).json({ message: 'Shipment not found' });
     await order.populate({ path: 'items.productId', select: 'name brand imageUrl' });
 

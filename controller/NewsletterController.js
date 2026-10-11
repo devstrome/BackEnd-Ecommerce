@@ -1,6 +1,7 @@
 const Newsletter = require('../models/Newsletter');
 const Subscriber = require('../models/Subscriber');
 const { sendEmail } = require('../utils/emailService');
+const { sanitizeEmailHtml } = require('../utils/sanitizeHtml');
 
 // Admin
 const getAllNewsletters = async (req, res) => {
@@ -18,11 +19,14 @@ const createNewsletter = async (req, res) => {
     if (!subject || !subject.trim()) {
       return res.status(400).json({ message: 'Subject is required' });
     }
-    if (!htmlContent || !htmlContent.trim()) {
+    if (typeof htmlContent !== 'string' || !htmlContent.trim()) {
       return res.status(400).json({ message: 'Email content is required' });
     }
+    if (htmlContent.length > 100000) {
+      return res.status(400).json({ message: 'Email content cannot exceed 100,000 characters' });
+    }
 
-    const newsletter = await Newsletter.create({ subject, htmlContent });
+    const newsletter = await Newsletter.create({ subject: subject.trim().slice(0, 200), htmlContent: sanitizeEmailHtml(htmlContent) });
     res.status(201).json({ message: 'Newsletter draft saved', newsletter });
   } catch (error) {
     res.status(500).json({ message: 'Error creating newsletter', error: error.message });
@@ -54,7 +58,7 @@ const sendNewsletter = async (req, res) => {
       subscribers.map((subscriber) =>
         sendEmail(subscriber.email, 'custom', {
           customSubject: newsletter.subject,
-          customHtml: newsletter.htmlContent
+          customHtml: sanitizeEmailHtml(newsletter.htmlContent)
         })
       )
     );

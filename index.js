@@ -3,11 +3,21 @@
 // ==============================
 const express = require('express');
 const dotenv = require('dotenv');
+const path = require('path');
+
+// Load environment variables before importing route/controller modules. Several
+// existing modules read JWT and provider settings at module initialization.
+dotenv.config({ path: path.join(__dirname, '.env') });
+
 const connectDB = require('./config/db');
 const colors = require('colors');
 const cors = require('cors');
+const helmet = require('helmet');
 const http = require('http');
 const socketIO = require('socket.io');
+const jwt = require('jsonwebtoken');
+const User = require('./models/User');
+const Admin = require('./models/Admin');
 
 // ==============================
 // Load routes
@@ -38,7 +48,6 @@ const CronRoutes = require('./routes/CronRoutes');
 const DashboardRoutes = require('./routes/DashboardRoutes');
 const PopupAdRoutes = require('./routes/popupAdRoutes');
 const PartnershipRoutes = require('./routes/PartnershipRoutes');
-const EmbeddingRoutes = require('./routes/EmbeddingRoutes');
 const SeoRoutes = require('./routes/SeoRoutes');
 const HeroSlideRoutes = require('./routes/HeroSlideRoutes');
 const AnnouncementRoutes = require('./routes/AnnouncementRoutes');
@@ -46,8 +55,6 @@ const SubscriberRoutes = require('./routes/SubscriberRoutes');
 const HelpPageRoutes = require('./routes/HelpPageRoutes');
 const BlogRoutes = require('./routes/BlogRoutes');
 const BanRoutes = require('./routes/BanRoutes');
-const { chat, history, clear } = require('./controller/AIAssistantController');
-const authenticate = require('./middleware/UserAuthMiddleware');
 
 const orderController = require('./controller/OrderController');
 const inventoryController = require('./controller/InventoryController');
@@ -58,8 +65,6 @@ const { setSocketIO: setStoreEventsIO } = require('./utils/storeEvents');
 // ==============================
 // Initialize environment & DB
 // ==============================
-const path = require('path');
-dotenv.config({ path: path.join(__dirname, '.env') });
 connectDB();
 
 // ==============================
@@ -71,25 +76,32 @@ const server = http.createServer(app);
 // ==============================
 // Middleware
 // ==============================
+// Baseline HTTP response protections. The API does not host executable pages,
+// so CSP is managed by the frontend rather than imposed on JSON responses.
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false,
+  crossOriginOpenerPolicy: false,
+  crossOriginResourcePolicy: false,
+  strictTransportSecurity: process.env.NODE_ENV === 'production' ? undefined : false,
+}));
 app.use(cors({
   origin: process.env.CLIENT_URL || "http://localhost:5173",
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
   credentials: true,
 }));
-// Trust the first proxy hop so req.ip reflects the real client for the ban list
-app.set('trust proxy', 1);
+// Trust only the proxy hops explicitly configured by the deployment. Leaving
+// this at 0 prevents clients that reach Node directly from spoofing X-Forwarded-For.
+const proxyHops = Number.parseInt(process.env.TRUST_PROXY_HOPS || '0', 10);
+app.set('trust proxy', Number.isInteger(proxyHops) && proxyHops >= 0 ? proxyHops : 0);
 // Courier webhooks need the RAW body for HMAC verification -> mount BEFORE express.json()
 app.use('/api/courier/webhook', require('./routes/CourierWebhookRoutes'));
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: false, limit: '100kb', parameterLimit: 100 }));
 
 // ==============================
 // API Routes
 // ==============================
-// AI Assistant — registered directly on app, before all routers, to avoid middleware interference
-app.post('/api/assistant/chat', authenticate, chat);
-app.get('/api/assistant/history', authenticate, history);
-app.delete('/api/assistant/clear', authenticate, clear);
-
 app.use("/api", ProductRoutes);
 app.use("/api", UserRoutes);
 app.use("/api", ImageSliderRoutes);
@@ -97,6 +109,9 @@ app.use("/api", AdminRoutes);
 app.use("/api", CartRoutes);
 app.use("/api", CategoriesRoutes);
 app.use("/api", BrandRoutes);
+app.use('/api', require('./routes/RegionRoutes'));
+app.use('/api', require('./routes/FinanceRoutes'));
+app.use('/api', require('./routes/LoyaltyRoutes'));
 app.use('/api', ColorRoutes);
 app.use('/api', SizeRoutes);
 app.use('/api', GenderRoutes);
@@ -117,7 +132,6 @@ app.use('/api/cron', CronRoutes);
 app.use('/api/dashboard', DashboardRoutes);
 app.use('/api', PopupAdRoutes);
 app.use('/api', PartnershipRoutes);
-app.use('/api', EmbeddingRoutes);
 app.use('/api', SeoRoutes);
 app.use('/api', HeroSlideRoutes);
 app.use('/api', AnnouncementRoutes);
@@ -130,6 +144,9 @@ app.use('/api', BanRoutes);
 // Socket.IO Configuration
 // ==============================
 const io = socketIO(server, {
+  // Chat images are uploaded separately; realtime events only need text and
+  // short URLs. This avoids accepting megabyte-sized websocket payloads.
+  maxHttpBufferSize: 64 * 1024,
   cors: {
     origin: process.env.CLIENT_URL || "http://localhost:5173",
     methods: ["GET", "POST"],
@@ -137,24 +154,42 @@ const io = socketIO(server, {
   },
 });
 
-// Socket.IO authentication middleware
-// Allow anonymous sockets for public features (e.g., product viewers)
-io.use((socket, next) => {
+// Socket.IO authentication. Public browsing may connect anonymously, while
+// identity-bearing events use the same signed, active access tokens as HTTP.
+io.use(async (socket, next) => {
   const token = socket.handshake.auth?.token;
   if (!token) {
-    console.log('ℹ️ Socket connection: No token provided (anonymous allowed for public events)');
-    socket.data = { isAuthenticated: false };
+    socket.data = { isAuthenticated: false, userType: 'guest' };
     return next();
   }
   try {
-    // In production, verify JWT here and set socket.data.user
-    socket.data = { isAuthenticated: true };
-    console.log('✅ Socket connection: Token provided', String(token).substring(0, 20) + '...');
+    if (typeof token !== 'string' || !process.env.JWT_SECRET) throw new Error('Invalid socket token');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const isAdminToken = Boolean(decoded.adminId);
+    const identityId = decoded.adminId || decoded.userId;
+    if (!identityId) throw new Error('Missing token identity');
+
+    const Model = isAdminToken ? Admin : User;
+    const identityFields = isAdminToken
+      ? 'accessTokens banned firstName lastName fullName superAdmin permissions'
+      : 'accessTokens banned firstName lastName fullName';
+    const identity = await Model.findById(identityId)
+      .select(identityFields)
+      .lean();
+    const activeToken = identity?.accessTokens?.some((entry) =>
+      entry.token === token && new Date(entry.expiresAt).getTime() > Date.now());
+    if (!identity || identity.banned || !activeToken) throw new Error('Inactive socket token');
+
+    socket.data = {
+      isAuthenticated: true,
+      userType: isAdminToken ? 'admin' : 'customer',
+      userId: String(identityId),
+      displayName: identity.fullName || [identity.firstName, identity.lastName].filter(Boolean).join(' '),
+      canViewOrders: Boolean(isAdminToken && (identity.superAdmin || identity.permissions?.includes('orders'))),
+    };
     return next();
-  } catch (error) {
-    console.log('❌ Socket connection: Invalid token (proceeding as anonymous)');
-    socket.data = { isAuthenticated: false };
-    return next();
+  } catch {
+    return next(new Error('Invalid or expired authentication token'));
   }
 });
 
@@ -177,8 +212,78 @@ const productViewers = new Map();
 const socketProducts = new Map();
 // Expose viewer tracking to routes (live viewers dashboard)
 app.set('productViewers', productViewers);
-// Track user online status: userId -> { socketId, lastActivity, userType }
+// Track authenticated customer presence independently from chat-room metadata.
+// A customer may have several tabs/devices connected at the same time.
 const userOnlineStatus = new Map();
+const socketUserPresence = new Map();
+const isSocketAdmin = (socket) => socket.data?.isAuthenticated && socket.data.userType === 'admin';
+const isSocketCustomer = (socket) => socket.data?.isAuthenticated && socket.data.userType === 'customer';
+const allowChatMutation = (socket) => {
+  const now = Date.now();
+  const current = socket.data?.chatMutationWindow;
+  if (!current || now - current.startedAt >= 60_000) {
+    socket.data.chatMutationWindow = { startedAt: now, count: 1 };
+    return true;
+  }
+  current.count += 1;
+  return current.count <= 30;
+};
+const isSafeChatImage = (value) => {
+  if (typeof value !== 'string' || value.length > 2048) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.hostname === 'res.cloudinary.com';
+  } catch {
+    return false;
+  }
+};
+const socketOwnsChatRoom = (socket, room) => isSocketAdmin(socket)
+  || (isSocketCustomer(socket) && String(room?.customerId?._id || room?.customerId) === socket.data.userId);
+
+const emitUserOnlineStatus = (userId, isOnline) => {
+  io.to('adminRoom').emit('userOnlineStatus', {
+    userId,
+    isOnline,
+    lastActivity: new Date(),
+  });
+};
+
+const registerUserPresence = (socket, rawUserId) => {
+  if (!socket.data?.isAuthenticated || !rawUserId) return false;
+  const userId = String(rawUserId).trim();
+  if (!userId) return false;
+
+  const previousUserId = socketUserPresence.get(socket.id);
+  if (previousUserId && previousUserId !== userId) unregisterUserPresence(socket);
+
+  let userPresence = userOnlineStatus.get(userId);
+  const becameOnline = !userPresence || userPresence.sockets.size === 0;
+  if (!userPresence) {
+    userPresence = { sockets: new Set(), lastActivity: new Date() };
+    userOnlineStatus.set(userId, userPresence);
+  }
+
+  userPresence.sockets.add(socket.id);
+  userPresence.lastActivity = new Date();
+  socketUserPresence.set(socket.id, userId);
+  if (becameOnline) emitUserOnlineStatus(userId, true);
+  return true;
+};
+
+function unregisterUserPresence(socket) {
+  const userId = socketUserPresence.get(socket.id);
+  if (!userId) return;
+
+  socketUserPresence.delete(socket.id);
+  const userPresence = userOnlineStatus.get(userId);
+  if (!userPresence) return;
+
+  userPresence.sockets.delete(socket.id);
+  if (userPresence.sockets.size === 0) {
+    userOnlineStatus.delete(userId);
+    emitUserOnlineStatus(userId, false);
+  }
+}
 
 // ==============================
 // Socket.IO Event Handlers
@@ -190,24 +295,10 @@ io.on('connection', (socket) => {
   // Join user room
   // ======================
   socket.on('joinUserRoom', (userId) => {
-    if (!userId) return;
-    socket.join(`user_${userId}`);
-    connectedUsers.set(socket.id, { userId, userType: 'user' });
-    
-    // Track user online status
-    userOnlineStatus.set(userId, {
-      socketId: socket.id,
-      lastActivity: new Date(),
-      userType: 'user'
-    });
-    
-    // Notify admin room about user coming online
-    io.to('adminRoom').emit('userOnlineStatus', {
-      userId,
-      isOnline: true,
-      lastActivity: new Date()
-    });
-    
+    if (!isSocketCustomer(socket) || String(userId) !== socket.data.userId) return;
+    if (!registerUserPresence(socket, userId)) return;
+    socket.join(`user_${String(userId)}`);
+    connectedUsers.set(socket.id, { userId: String(userId), userType: 'user' });
     console.log(`👤 User ${userId} joined room user_${userId}`);
   });
 
@@ -215,7 +306,9 @@ io.on('connection', (socket) => {
   // Join admin room
   // ======================
   socket.on('joinAdminRoom', () => {
+    if (!isSocketAdmin(socket)) return;
     socket.join('adminRoom');
+    if (socket.data.canViewOrders) socket.join('adminOrdersRoom');
     connectedUsers.set(socket.id, { userType: 'admin' });
     console.log(`🛡️ Admin joined admin room`);
   });
@@ -224,6 +317,7 @@ io.on('connection', (socket) => {
   // Get online users list
   // ======================
   socket.on('getOnlineUsers', () => {
+    if (!isSocketAdmin(socket)) return;
     const onlineUsers = Array.from(userOnlineStatus.keys());
     socket.emit('onlineUsersList', { onlineUsers });
     console.log(`📋 Sent online users list to admin: ${onlineUsers.length} users`);
@@ -233,22 +327,9 @@ io.on('connection', (socket) => {
   // User login event (when user logs in)
   // ======================
   socket.on('userLogin', (userId) => {
-    if (!userId) return;
-    
-    // Track user online status
-    userOnlineStatus.set(userId, {
-      socketId: socket.id,
-      lastActivity: new Date(),
-      userType: 'user'
-    });
-    
-    // Notify admin room about user coming online
-    io.to('adminRoom').emit('userOnlineStatus', {
-      userId,
-      isOnline: true,
-      lastActivity: new Date()
-    });
-    
+    if (!isSocketCustomer(socket) || String(userId) !== socket.data.userId) return;
+    if (!registerUserPresence(socket, userId)) return;
+    socket.join(`user_${String(userId)}`);
     console.log(`👤 User ${userId} logged in and is now online`);
   });
 
@@ -256,6 +337,7 @@ io.on('connection', (socket) => {
   // Dashboard events
   // ======================
   socket.on('joinDashboard', () => {
+    if (!isSocketAdmin(socket)) return;
     socket.join('dashboardRoom');
     connectedUsers.set(socket.id, { userType: 'admin', room: 'dashboard' });
     console.log(`📊 Admin joined dashboard room`);
@@ -264,13 +346,14 @@ io.on('connection', (socket) => {
   // ======================
   // User activity tracking
   // ======================
-  socket.on('userActivity', (data) => {
+  socket.on('userActivity', (data = {}) => {
     const { userId, activity } = data;
-    if (!userId) return;
+    if (!isSocketCustomer(socket) || String(userId) !== socket.data.userId || !activity) return;
     
     // Update user's last activity
-    if (userOnlineStatus.has(userId)) {
-      userOnlineStatus.get(userId).lastActivity = new Date();
+    const userPresence = userOnlineStatus.get(String(userId));
+    if (userPresence) {
+      userPresence.lastActivity = new Date();
     }
     
     // Notify admin room about user activity
@@ -286,44 +369,41 @@ io.on('connection', (socket) => {
   // ======================
   // User online status updates
   // ======================
-  socket.on('updateUserStatus', (data) => {
+  socket.on('updateUserStatus', (data = {}) => {
     const { userId, status } = data;
-    if (!userId) return;
+    if (!isSocketCustomer(socket) || String(userId) !== socket.data.userId) return;
     
     if (status === 'online') {
-      if (!userOnlineStatus.has(userId)) {
-        userOnlineStatus.set(userId, {
-          socketId: socket.id,
-          lastActivity: new Date(),
-          userType: 'user'
-        });
-      }
+      registerUserPresence(socket, userId);
     } else if (status === 'offline') {
-      userOnlineStatus.delete(userId);
+      unregisterUserPresence(socket);
     }
-    
-    // Notify admin room about status change
-    io.to('adminRoom').emit('userOnlineStatus', {
-      userId,
-      isOnline: status === 'online',
-      lastActivity: new Date()
-    });
   });
 
   // ======================
   // Chat room logic
   // ======================
-  socket.on('joinChatRoom', ({ roomId, userId, userType }) => {
-    if (!roomId) {
-      console.log('❌ joinChatRoom: Missing roomId');
+  socket.on('joinChatRoom', async (payload = {}) => {
+    if (!allowChatMutation(socket)) return;
+    const { roomId, userId, userType } = payload;
+    if (!roomId || !['admin', 'customer'].includes(userType)) {
+      return;
+    }
+
+    try {
+      const ChatRoom = require('./models/ChatRoom');
+      const room = await ChatRoom.findById(roomId).select('customerId');
+      if (!room || !socketOwnsChatRoom(socket, room)) return;
+      if (userType === 'admin' && !isSocketAdmin(socket)) return;
+      if (userType === 'customer' && (!isSocketCustomer(socket) || String(userId) !== socket.data.userId)) return;
+    } catch {
       return;
     }
     
     socket.join(`chat_${roomId}`);
     
     if (userType === 'admin') {
-      // For admin connections, userId might be the admin's ID or undefined
-      connectedUsers.set(socket.id, { userId, userType, roomId });
+      connectedUsers.set(socket.id, { userId: socket.data.userId, userType, roomId });
       console.log(`🛡️ Admin joined chat_${roomId}`);
     } else {
       // For user connections, userId is required
@@ -331,7 +411,7 @@ io.on('connection', (socket) => {
         console.log('❌ joinChatRoom: Missing userId for user connection');
         return;
       }
-      connectedUsers.set(socket.id, { userId, userType, roomId });
+      connectedUsers.set(socket.id, { userId: socket.data.userId, userType, roomId });
       console.log(`👤 User ${userId} (${userType}) joined chat_${roomId}`);
     }
     
@@ -342,11 +422,16 @@ io.on('connection', (socket) => {
   });
 
   socket.on('sendMessage', async (message) => {
-    const { roomId, senderId, senderType, text, image, tempId } = message;
+    const { roomId, text, image, tempId } = message || {};
+    const senderId = socket.data?.userId;
+    const senderType = socket.data?.userType;
     const hasText = typeof text === 'string' && text.trim().length > 0;
     const hasImage = typeof image === 'string' && image.trim().length > 0;
-    if (!roomId || !senderId || (!hasText && !hasImage)) {
-      console.log('❌ sendMessage: Missing required fields', { roomId, senderId, text, image });
+    if (!socket.data?.isAuthenticated || !['admin', 'customer'].includes(senderType) || !roomId || !senderId || (!hasText && !hasImage)) {
+      return;
+    }
+    if (!allowChatMutation(socket) || (hasText && text.length > 5000) || (hasImage && !isSafeChatImage(image))) {
+      socket.emit('messageError', { error: 'Message is too large or contains an unsupported image URL' });
       return;
     }
     
@@ -363,12 +448,12 @@ io.on('connection', (socket) => {
         try {
           room = await ChatRoom.findById(roomId);
           if (!room) {
-            console.log('❌ sendMessage: Room not found', roomId);
             return;
           }
+
+          if (!socketOwnsChatRoom(socket, room)) return;
           
           if (room.isClosed) {
-            console.log('❌ sendMessage: Cannot send message to closed room', roomId);
             return;
           }
           
@@ -377,6 +462,7 @@ io.on('connection', (socket) => {
             _id: new mongoose.Types.ObjectId(), // Explicitly set _id
             senderId, 
             senderType, 
+            senderName: socket.data.displayName || (senderType === 'admin' ? 'BELORELLA Support' : 'Customer'),
             text: hasText ? text : '',
             image: hasImage ? image : '',
             reaction: "",
@@ -441,18 +527,14 @@ io.on('connection', (socket) => {
   // Toggle an emoji reaction on a message (both client and admin sides emit this)
   socket.on('addReaction', async (payload) => {
     try {
-      const { roomId, messageId, emoji, userId, userName } = payload || {};
-      if (!roomId || !messageId || !emoji) {
-        console.log('❌ addReaction: Missing required fields', { roomId, messageId, emoji });
-        return;
-      }
+      const { roomId, messageId, emoji } = payload || {};
+      const userId = socket.data?.userId;
+      if (!socket.data?.isAuthenticated || !roomId || !messageId || typeof emoji !== 'string' || emoji.length > 16) return;
+      if (!allowChatMutation(socket)) return;
 
       const ChatRoom = require('./models/ChatRoom');
       const room = await ChatRoom.findById(roomId);
-      if (!room) {
-        console.log('❌ addReaction: Room not found', roomId);
-        return;
-      }
+      if (!room || !socketOwnsChatRoom(socket, room)) return;
 
       const msg = room.messages.id(messageId);
       if (!msg) {
@@ -460,7 +542,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const senderType = payload.senderType === 'admin' ? 'admin' : 'customer';
+      const senderType = socket.data.userType;
       if (!msg.reactions) msg.reactions = [];
 
       const existingIdx = msg.reactions.findIndex(r => String(r.userId) === String(userId));
@@ -478,7 +560,7 @@ io.on('connection', (socket) => {
           emoji,
           userId,
           senderType,
-          userName: userName || '',
+          userName: socket.data.displayName || '',
           createdAt: new Date()
         });
       }
@@ -505,15 +587,17 @@ io.on('connection', (socket) => {
   });
 
   // Edit own message (broadcast to both sides)
-  socket.on('editMessage', async ({ roomId, messageId, text, senderId }) => {
+  socket.on('editMessage', async ({ roomId, messageId, text } = {}) => {
     try {
-      if (!roomId || !messageId || !senderId) {
-        console.log('❌ editMessage: Missing required fields', { roomId, messageId, senderId });
+      const senderId = socket.data?.userId;
+      if (!socket.data?.isAuthenticated || !roomId || !messageId || !senderId) return;
+      if (typeof text !== 'string' || text.length > 5000 || !allowChatMutation(socket)) {
+        socket.emit('messageError', { error: 'Message is too large or you are sending updates too quickly' });
         return;
       }
       const ChatRoom = require('./models/ChatRoom');
       const room = await ChatRoom.findById(roomId);
-      if (!room) return;
+      if (!room || !socketOwnsChatRoom(socket, room)) return;
       const msg = room.messages.id(messageId);
       if (!msg) {
         socket.emit('messageError', { error: 'Message not found' });
@@ -544,15 +628,14 @@ io.on('connection', (socket) => {
   });
 
   // Delete own message (soft delete, broadcast to both sides)
-  socket.on('deleteMessage', async ({ roomId, messageId, senderId }) => {
+  socket.on('deleteMessage', async ({ roomId, messageId } = {}) => {
     try {
-      if (!roomId || !messageId || !senderId) {
-        console.log('❌ deleteMessage: Missing required fields', { roomId, messageId, senderId });
-        return;
-      }
+      const senderId = socket.data?.userId;
+      if (!socket.data?.isAuthenticated || !roomId || !messageId || !senderId) return;
+      if (!allowChatMutation(socket)) return;
       const ChatRoom = require('./models/ChatRoom');
       const room = await ChatRoom.findById(roomId);
-      if (!room) return;
+      if (!room || !socketOwnsChatRoom(socket, room)) return;
       const msg = room.messages.id(messageId);
       if (!msg) {
         socket.emit('messageError', { error: 'Message not found' });
@@ -589,44 +672,49 @@ io.on('connection', (socket) => {
   // Product viewers logic
   // ======================
   socket.on('joinProduct', (productId) => {
-    if (!productId) return;
+    if (typeof productId !== 'string' || !/^[0-9a-f]{24}$/i.test(productId)) return;
+    const safeProductId = productId.toLowerCase();
+    const joinedProducts = socketProducts.get(socket.id);
+    if (joinedProducts?.has(safeProductId) || joinedProducts?.size >= 10) return;
     // Track socket in product viewer set
-    if (!productViewers.has(productId)) productViewers.set(productId, new Set());
-    productViewers.get(productId).add(socket.id);
+    if (!productViewers.has(safeProductId)) productViewers.set(safeProductId, new Set());
+    productViewers.get(safeProductId).add(socket.id);
     // Track product on socket
     if (!socketProducts.has(socket.id)) socketProducts.set(socket.id, new Set());
-    socketProducts.get(socket.id).add(productId);
+    socketProducts.get(socket.id).add(safeProductId);
     // Join product room and emit viewer count
-    socket.join(`product_${productId}`);
-    const count = productViewers.get(productId).size;
-    io.to(`product_${productId}`).emit('viewerCountUpdate', count);
-    io.to('adminRoom').emit('viewerCountUpdate', { productId, viewerCount: count });
-    console.log(`👀 Socket ${socket.id} joined product ${productId}. Viewers: ${count}`);
+    socket.join(`product_${safeProductId}`);
+    const count = productViewers.get(safeProductId).size;
+    io.to(`product_${safeProductId}`).emit('viewerCountUpdate', count);
+    io.to('adminRoom').emit('viewerCountUpdate', { productId: safeProductId, viewerCount: count });
+    console.log(`👀 Socket ${socket.id} joined product ${safeProductId}. Viewers: ${count}`);
   });
 
   socket.on('leaveProduct', (productId) => {
-    if (!productId) return;
-    if (productViewers.has(productId)) {
-      productViewers.get(productId).delete(socket.id);
-      const count = productViewers.get(productId).size;
-      io.to(`product_${productId}`).emit('viewerCountUpdate', count);
-      io.to('adminRoom').emit('viewerCountUpdate', { productId, viewerCount: count });
-      console.log(`👋 Socket ${socket.id} left product ${productId}. Viewers: ${count}`);
+    if (typeof productId !== 'string' || !/^[0-9a-f]{24}$/i.test(productId)) return;
+    const safeProductId = productId.toLowerCase();
+    if (!socketProducts.get(socket.id)?.has(safeProductId)) return;
+    if (productViewers.has(safeProductId)) {
+      productViewers.get(safeProductId).delete(socket.id);
+      const count = productViewers.get(safeProductId).size;
+      if (count === 0) productViewers.delete(safeProductId);
+      io.to(`product_${safeProductId}`).emit('viewerCountUpdate', count);
+      io.to('adminRoom').emit('viewerCountUpdate', { productId: safeProductId, viewerCount: count });
+      console.log(`👋 Socket ${socket.id} left product ${safeProductId}. Viewers: ${count}`);
     }
-    socket.leave(`product_${productId}`);
+    socket.leave(`product_${safeProductId}`);
     if (socketProducts.has(socket.id)) {
-      socketProducts.get(socket.id).delete(productId);
+      socketProducts.get(socket.id).delete(safeProductId);
       if (socketProducts.get(socket.id).size === 0) socketProducts.delete(socket.id);
     }
   });
 
   // Handle marking messages as read via socket
   socket.on('markMessagesAsRead', async (data) => {
-    const { roomId, readerType, readerId } = data;
-    if (!roomId || !readerType || !readerId) {
-      console.log('❌ markMessagesAsRead: Missing required fields', { roomId, readerType, readerId });
-      return;
-    }
+    const { roomId } = data || {};
+    const readerType = socket.data?.userType;
+    const readerId = socket.data?.userId;
+    if (!socket.data?.isAuthenticated || !roomId || !readerId) return;
     
     try {
       // Update database with retry logic for concurrency issues
@@ -638,10 +726,7 @@ io.on('connection', (socket) => {
       while (retries > 0) {
         try {
           room = await ChatRoom.findById(roomId);
-          if (!room) {
-            console.log('❌ markMessagesAsRead: Room not found', roomId);
-            return;
-          }
+          if (!room || !socketOwnsChatRoom(socket, room)) return;
           
           // Mark all unread messages as read by this user type
           let hasChanges = false;
@@ -716,29 +801,24 @@ io.on('connection', (socket) => {
   });
 
   // Handle online status updates via socket
-  socket.on('updateOnlineStatus', (data) => {
-    const { roomId, userId, isOnline } = data;
-    if (!roomId || !userId) {
-      console.log('❌ updateOnlineStatus: Missing required fields', { roomId, userId });
+  socket.on('updateOnlineStatus', async (data) => {
+    const { roomId } = data || {};
+    const userId = socket.data?.userId;
+    if (!socket.data?.isAuthenticated || !roomId || !userId) return;
+    try {
+      const ChatRoom = require('./models/ChatRoom');
+      const room = await ChatRoom.findById(roomId).select('customerId');
+      if (!room || !socketOwnsChatRoom(socket, room)) return;
+      io.to(`chat_${roomId}`).emit('onlineStatusChanged', { roomId, userId, isOnline: true });
+    } catch {
       return;
     }
-    
-    // Emit to all users in the room
-    io.to(`chat_${roomId}`).emit('onlineStatusChanged', { 
-      roomId, 
-      userId, 
-      isOnline 
-    });
-    console.log(`🟢 Online status updated in chat_${roomId}: ${userId} is ${isOnline ? 'online' : 'offline'}`);
   });
 
   // Handle room updates via socket
   socket.on('updateRoom', (data) => {
-    const { roomId, updates } = data;
-    if (!roomId || !updates) {
-      console.log('❌ updateRoom: Missing required fields', { roomId, updates });
-      return;
-    }
+    const { roomId, updates } = data || {};
+    if (!isSocketAdmin(socket) || !roomId || !updates || typeof updates !== 'object') return;
     
     // Emit to all users in the room
     io.to(`chat_${roomId}`).emit('roomUpdated', { 
@@ -750,12 +830,11 @@ io.on('connection', (socket) => {
 
   // Handle get room data via socket
   socket.on('getRoomData', async (data) => {
-    const { userId } = data;
-    if (!userId) {
-      console.log('❌ getRoomData: Missing userId');
+    if (!isSocketCustomer(socket) || (data?.userId && String(data.userId) !== socket.data.userId)) {
       socket.emit('roomDataReceived', null);
       return;
     }
+    const userId = socket.data.userId;
     
     try {
       const ChatRoom = require('./models/ChatRoom');
@@ -794,41 +873,35 @@ io.on('connection', (socket) => {
   });
 
   // Typing indicator events
-  socket.on('typingStart', ({ roomId, senderId, senderType }) => {
-    if (!roomId || !senderId) {
-      console.log('❌ typingStart: Missing required fields', { roomId, senderId });
+  const relayTyping = async (data, isTyping) => {
+    const { roomId } = data || {};
+    if (!socket.data?.isAuthenticated || !roomId) return;
+    try {
+      const ChatRoom = require('./models/ChatRoom');
+      const room = await ChatRoom.findById(roomId).select('customerId');
+      if (!room || !socketOwnsChatRoom(socket, room)) return;
+      socket.to(`chat_${roomId}`).emit('userTyping', {
+        roomId,
+        senderId: socket.data.userId,
+        senderType: socket.data.userType,
+        isTyping,
+      });
+    } catch {
       return;
     }
-    
-    // Emit to all users in the room except the sender
-    socket.to(`chat_${roomId}`).emit('userTyping', { 
-      roomId, 
-      senderId, 
-      senderType,
-      isTyping: true 
-    });
-    console.log(`⌨️ User ${senderId} started typing in chat_${roomId}`);
+  };
+
+  socket.on('typingStart', (data) => {
+    relayTyping(data, true);
   });
 
-  socket.on('typingStop', ({ roomId, senderId, senderType }) => {
-    if (!roomId || !senderId) {
-      console.log('❌ typingStop: Missing required fields', { roomId, senderId });
-      return;
-    }
-    
-    // Emit to all users in the room except the sender
-    socket.to(`chat_${roomId}`).emit('userTyping', { 
-      roomId, 
-      senderId, 
-      senderType,
-      isTyping: false 
-    });
-    console.log(`⌨️ User ${senderId} stopped typing in chat_${roomId}`);
+  socket.on('typingStop', (data) => {
+    relayTyping(data, false);
   });
 
   // Handle product update events from admin
   socket.on('productUpdated', (data) => {
-    console.log('Product update event received:', data);
+    if (!isSocketAdmin(socket) || !data?.productId) return;
     // Emit to product room
     io.to(`product_${data.productId}`).emit('productUpdate', {
       productId: data.productId,
@@ -839,7 +912,7 @@ io.on('connection', (socket) => {
 
   // Handle inventory assignment events from admin
   socket.on('inventoryAssigned', (data) => {
-    console.log('Inventory assignment event received:', data);
+    if (!isSocketAdmin(socket) || !data?.productId) return;
     // Emit to product room
     io.to(`product_${data.productId}`).emit('inventoryAssignment', {
       productId: data.productId,
@@ -854,7 +927,7 @@ io.on('connection', (socket) => {
 
   // Handle inventory removal events from admin
   socket.on('inventoryRemoved', (data) => {
-    console.log('Inventory removal event received:', data);
+    if (!isSocketAdmin(socket) || !data?.productId) return;
     // Emit to product room
     io.to(`product_${data.productId}`).emit('inventoryAssignment', {
       productId: data.productId,
@@ -869,7 +942,7 @@ io.on('connection', (socket) => {
 
   // Handle order update events from admin
   socket.on('orderUpdated', (data) => {
-    console.log('Order update event received:', data);
+    if (!isSocketAdmin(socket) || !data?.orderId) return;
     // Emit to admin room for monitoring
     io.to('adminRoom').emit('admin:updateOrder', {
       orderId: data.orderId,
@@ -890,21 +963,10 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
+    unregisterUserPresence(socket);
     const userData = connectedUsers.get(socket.id);
     if (userData) {
       console.log(`❌ Client disconnected: ${userData.userId || 'Admin'} (${userData.userType})`);
-      
-      // If it's a user disconnecting, update their online status
-      if (userData.userId && userData.userType === 'user') {
-        userOnlineStatus.delete(userData.userId);
-        
-        // Notify admin room about user going offline
-        io.to('adminRoom').emit('userOnlineStatus', {
-          userId: userData.userId,
-          isOnline: false,
-          lastActivity: new Date()
-        });
-      }
       
       connectedUsers.delete(socket.id);
     } else {
@@ -917,6 +979,7 @@ io.on('connection', (socket) => {
         if (productViewers.has(pid)) {
           productViewers.get(pid).delete(socket.id);
           const count = productViewers.get(pid).size;
+          if (count === 0) productViewers.delete(pid);
           io.to(`product_${pid}`).emit('viewerCountUpdate', count);
           io.to('adminRoom').emit('viewerCountUpdate', { productId: pid, viewerCount: count });
         }

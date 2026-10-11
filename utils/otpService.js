@@ -1,9 +1,18 @@
 const OTP = require('../models/OTP');
 const { sendEmail } = require('./emailService');
+const { randomInt } = require('crypto');
+
+const OTP_TYPES = new Set(['registration', 'password_reset', 'email_change', 'email_verification']);
+const normalizeOtpRequest = (email, type) => {
+  if (typeof email !== 'string' || typeof type !== 'string' || !OTP_TYPES.has(type)) return null;
+  const normalizedEmail = email.trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) return null;
+  return { email: normalizedEmail, type };
+};
 
 // Generate 6-digit OTP
 const generateOTP = () => {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  return String(randomInt(100000, 1000000));
 };
 
 // Send OTP email
@@ -189,6 +198,20 @@ const sendOTPEmail = async (email, otp, type = 'registration') => {
 // Create and send OTP
 const createAndSendOTP = async (email, type = 'registration') => {
   try {
+    const normalized = normalizeOtpRequest(email, type);
+    if (!normalized) return { success: false, message: 'A valid email and verification type are required' };
+    email = normalized.email;
+
+    // Apply the per-address cooldown here as well as in resendOTP so direct
+    // registration/reset endpoints cannot bypass it by requesting a new OTP.
+    const recentOTP = await OTP.findOne({
+      email,
+      type,
+      isUsed: false,
+      createdAt: { $gt: new Date(Date.now() - 60 * 1000) },
+    }).select('_id').lean();
+    if (recentOTP) return { success: false, message: 'Please wait 1 minute before requesting a new OTP' };
+
     // Delete any existing unused OTPs for this email and type
     await OTP.deleteMany({ 
       email, 
@@ -230,6 +253,11 @@ const createAndSendOTP = async (email, type = 'registration') => {
 // Verify OTP
 const verifyOTP = async (email, otp, type = 'registration', markAsUsed = true) => {
   try {
+    const normalized = normalizeOtpRequest(email, type);
+    if (!normalized || typeof otp !== 'string' || !/^\d{6}$/.test(otp)) {
+      return { success: false, message: 'Invalid or expired OTP' };
+    }
+    email = normalized.email;
     console.log(`🔍 Verifying OTP for ${email}, type: ${type}, markAsUsed: ${markAsUsed}`);
     
     const otpDoc = await OTP.findOne({
@@ -271,8 +299,16 @@ const verifyOTP = async (email, otp, type = 'registration', markAsUsed = true) =
 // Increment failed attempts
 const incrementFailedAttempts = async (email, otp, type = 'registration') => {
   try {
+    const normalized = normalizeOtpRequest(email, type);
+    if (!normalized) return;
     await OTP.findOneAndUpdate(
-      { email: email.toLowerCase(), otp, type, isUsed: false },
+      {
+        email: normalized.email,
+        type: normalized.type,
+        isUsed: false,
+        expiresAt: { $gt: new Date() },
+        attempts: { $lt: 5 },
+      },
       { $inc: { attempts: 1 } }
     );
   } catch (error) {
@@ -283,6 +319,9 @@ const incrementFailedAttempts = async (email, otp, type = 'registration') => {
 // Resend OTP
 const resendOTP = async (email, type = 'registration') => {
   try {
+    const normalized = normalizeOtpRequest(email, type);
+    if (!normalized) return { success: false, message: 'A valid email and verification type are required' };
+    email = normalized.email;
     // Check if there's a recent OTP (within 1 minute)
     const recentOTP = await OTP.findOne({
       email: email.toLowerCase(),

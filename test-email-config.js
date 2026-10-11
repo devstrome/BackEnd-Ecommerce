@@ -1,5 +1,6 @@
 const nodemailer = require('nodemailer');
 require('dotenv').config();
+const { BRAND } = require('./utils/brand');
 
 async function testEmailConfig() {
   console.log('🧪 Testing Email Configuration...\n');
@@ -42,6 +43,7 @@ async function testEmailConfig() {
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
           <div style="background: linear-gradient(135deg, #B1123B 0%, #8F0E2F 100%); padding: 20px; text-align: center; color: white;">
+            <img src="${BRAND.LOGO_URL}" alt="${BRAND.NAME}" width="64" height="64" style="display:block;width:64px;height:64px;object-fit:contain;margin:0 auto 8px;border:0;">
             <h1 style="margin: 0;">BELORELLA</h1>
             <p style="margin: 5px 0;">Premium Fashion & Lifestyle</p>
           </div>

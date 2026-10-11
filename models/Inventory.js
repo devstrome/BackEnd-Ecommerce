@@ -11,6 +11,8 @@ const InventorySchema = new mongoose.Schema({
     type: Schema.Types.ObjectId,
     required: true
   },
+  regionId: { type: Schema.Types.ObjectId, ref: 'Region', default: null },
+  regionName: { type: String, default: '' },
   size: {
     type: String,
     required: true
@@ -35,10 +37,23 @@ const InventorySchema = new mongoose.Schema({
     type: Number,
     min: 0
   },
+  costPrice: {
+    type: Number,
+    min: 0,
+    default: null,
+  },
   barcode: {
     type: String,
     unique: true,
     required: true
+  },
+  // Manufacturer/product barcode entered by staff. It is intentionally not
+  // unique: the same retail barcode commonly identifies every unit in a SKU.
+  realBarcode: {
+    type: String,
+    trim: true,
+    default: '',
+    maxlength: 120,
   },
   qrCode: {
     type: String,
@@ -139,5 +154,6 @@ InventorySchema.statics.generateQRCode = async function() {
 // Index for better query performance
 InventorySchema.index({ productId: 1, variantId: 1, size: 1 });
 InventorySchema.index({ status: 1 });
+InventorySchema.index({ realBarcode: 1 });
 
 module.exports = mongoose.model("Inventory", InventorySchema);

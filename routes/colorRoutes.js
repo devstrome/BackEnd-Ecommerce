@@ -18,7 +18,7 @@ router.get('/colors',  getColors);
 router.post('/colors', authenticateAdmin, addColor);
 router.put('/colors/:id', authenticateAdmin, updateColor);
 
-// Delete — super admin only
-router.delete('/colors/:id', authenticateAdmin,  deleteColor);
+// Delete — requires the Products module permission
+router.delete('/colors/:id', authenticateAdmin, deleteColor);
 
 module.exports = router;

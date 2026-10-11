@@ -10,6 +10,18 @@ const cartItemSchema = new Schema({
     type: Schema.Types.ObjectId,
     ref: 'Product',
   },
+  regionId: { type: Schema.Types.ObjectId, ref: 'Region', default: null },
+  regionName: { type: String, default: '' },
+  sku: { type: String, default: '' },
+  hexCode: { type: String, default: '' },
+  originalPrice: { type: Number, min: 0 },
+  discountPrice: { type: Number, min: 0, default: null },
+  stockAvailable: { type: Number, min: 0, default: null },
+  isAvailable: { type: Boolean, default: true },
+  unavailableReason: { type: String, default: '' },
+  isPreOrder: { type: Boolean, default: false },
+  isDigitalProduct: { type: Boolean, default: false },
+  preOrderEstimatedDate: { type: Date, default: null },
   discountApplied: {
     type: Number,
     default: 0, // Store the discount amount applied to this item

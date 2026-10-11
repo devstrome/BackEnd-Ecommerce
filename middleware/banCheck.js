@@ -1,10 +1,9 @@
 const Ban = require('../models/Ban');
 
-// Extract the client's IP, preferring the real client behind a proxy/CDN.
+// Express resolves the client address using the configured trusted proxy chain.
+// Reading x-forwarded-for directly lets an untrusted caller spoof a ban identity.
 function clientIp(req) {
-  const fwd = req.headers['x-forwarded-for'];
-  if (fwd) return String(fwd).split(',')[0].trim();
-  return req.ip || req.connection?.remoteAddress || '';
+  return req.ip || req.socket?.remoteAddress || req.connection?.remoteAddress || '';
 }
 
 // Parse a coarse network identifier (first 3 octets for IPv4) for grouping.

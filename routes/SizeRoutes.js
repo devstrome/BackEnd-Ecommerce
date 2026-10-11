@@ -9,7 +9,7 @@ const {
 } = require('../controller/sizeController');
 
 
-const { authenticateAdmin  } = require('../middleware/AdminAuthMiddleware');
+const { authenticateAdmin } = require('../middleware/AdminAuthMiddleware');
 
 // Read — any authenticated admin
 router.get('/sizes', getSizes);
@@ -18,7 +18,7 @@ router.get('/sizes', getSizes);
 router.post('/sizes', authenticateAdmin, addSize);
 router.put('/sizes/:id', authenticateAdmin, updateSize);
 
-// Delete — super admin only
-router.delete('/sizes/:id', authenticateAdmin,  deleteSize);
+// Delete — requires the Products module permission
+router.delete('/sizes/:id', authenticateAdmin, deleteSize);
 
 module.exports = router;

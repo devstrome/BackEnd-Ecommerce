@@ -9,7 +9,7 @@ const {
 } = require('../controller/GenderController');
 
 
-const { authenticateAdmin , requireSuperAdmin } = require('../middleware/AdminAuthMiddleware');
+const { authenticateAdmin } = require('../middleware/AdminAuthMiddleware');
 
 // Read — any authenticated admin
 router.get('/genders', getGenders);
@@ -18,7 +18,7 @@ router.get('/genders', getGenders);
 router.post('/genders', authenticateAdmin, addGender);
 router.put('/genders/:id', authenticateAdmin, updateGender);
 
-// Delete — super admin only
-router.delete('/genders/:id', authenticateAdmin, requireSuperAdmin, deleteGender);
+// Delete — requires the Products module permission
+router.delete('/genders/:id', authenticateAdmin, deleteGender);
 
 module.exports = router;

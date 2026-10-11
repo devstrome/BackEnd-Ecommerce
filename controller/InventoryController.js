@@ -3,6 +3,7 @@ const Product = require('../models/Product');
 const catchAsyncErrors = require('../middleware/catchAsyncErrors');
 const ErrorHandler = require('../utils/errorHandler');
 const mongoose = require('mongoose');
+const escapeRegex = require('../utils/escapeRegex');
 
 // Socket.io instance (set from server.js)
 let ioInstance = null;
@@ -23,11 +24,17 @@ function notifyInventoryUpdate(inventory, eventType) {
 // Attach variant/color information to an inventory item (shared by list & scan endpoints)
 const enrichInventoryItem = (itemObj) => {
   if (itemObj.productId && itemObj.productId.variants) {
-    const variant = itemObj.productId.variants.find(v => v._id.toString() === itemObj.variantId.toString());
+    const variantId = itemObj.variantId?._id || itemObj.variantId;
+    const variant = itemObj.productId.variants.find(v => v._id.toString() === String(variantId || ''));
     if (variant) {
+      const variantRegionId = variant.regionId?._id || variant.regionId || null;
+      const storedRegionId = itemObj.regionId?._id || itemObj.regionId || null;
+      const regionName = variant.regionId?.name || itemObj.regionId?.name || itemObj.regionName || '';
       itemObj.variantId = {
         _id: variant._id,
         colorName: variant.colorName,
+        regionId: variantRegionId || storedRegionId,
+        regionName,
         hexCode: variant.hexCode,
         images: variant.images,
         sizes: variant.sizes,
@@ -38,12 +45,14 @@ const enrichInventoryItem = (itemObj) => {
         measureType: variant.measureType,
         unitName: variant.unitName
       };
+      itemObj.regionId = variantRegionId || storedRegionId;
+      itemObj.regionName = regionName;
       // Add color information at the top level for easier access
       itemObj.colorName = variant.colorName;
       itemObj.hexCode = variant.hexCode;
-      itemObj.variantImage = variant.images?.[0]?.url;
+      itemObj.variantImage = variant.images?.[0]?.url || variant.images?.[0];
       // Also include the new fields from the inventory model
-      itemObj.imageUri = itemObj.imageUri || variant.images?.[0]?.url;
+      itemObj.imageUri = itemObj.imageUri || variant.images?.[0]?.url || variant.images?.[0];
       itemObj.color = itemObj.color || {
         name: variant.colorName || 'Default',
         hexCode: variant.hexCode || '#000000'
@@ -58,17 +67,47 @@ exports.enrichInventoryItem = enrichInventoryItem;
 exports.getAllInventory = catchAsyncErrors(async (req, res, next) => {
   const {
     page = 1, limit = 10, search = '', status = '', productId = '',
-    variantId = '', color = '', size = ''
+    variantId = '', regionId = '', color = '', size = ''
   } = req.query;
+
+  const stringFilters = [search, status, productId, variantId, regionId, color, size];
+  if (stringFilters.some((value) => typeof value !== 'string')) {
+    return res.status(400).json({ message: 'Inventory filters must be single string values' });
+  }
+  const pageText = String(page);
+  const limitText = String(limit);
+  if (!/^\d+$/.test(pageText) || !/^\d+$/.test(limitText)) {
+    return res.status(400).json({ message: 'Page and limit must be positive integers' });
+  }
+  const pageNum = Number(pageText);
+  const limitNum = Number(limitText);
+  if (!Number.isSafeInteger(pageNum) || pageNum < 1 || pageNum > 10000000 ||
+      !Number.isSafeInteger(limitNum) || limitNum < 1) {
+    return res.status(400).json({ message: 'Page and limit are outside the supported range' });
+  }
+  if (productId && !mongoose.Types.ObjectId.isValid(productId)) {
+    return res.status(400).json({ message: 'Invalid product ID' });
+  }
+  if (variantId && !mongoose.Types.ObjectId.isValid(variantId)) {
+    return res.status(400).json({ message: 'Invalid variant ID' });
+  }
+  if (regionId && !mongoose.Types.ObjectId.isValid(regionId)) {
+    return res.status(400).json({ message: 'Invalid region ID' });
+  }
+  if (search.length > 100 || color.length > 100 || size.length > 100) {
+    return res.status(400).json({ message: 'Search, color, and size filters must be 100 characters or fewer' });
+  }
   
   const query = {};
   const andClauses = [];
   
   if (search) {
+    const searchRegex = escapeRegex(String(search).trim().slice(0, 100));
     andClauses.push({
       $or: [
-        { barcode: { $regex: search, $options: 'i' } },
-        { qrCode: { $regex: search, $options: 'i' } }
+        { barcode: { $regex: searchRegex, $options: 'i' } },
+        { realBarcode: { $regex: searchRegex, $options: 'i' } },
+        { qrCode: { $regex: searchRegex, $options: 'i' } }
       ]
     });
   }
@@ -85,12 +124,31 @@ exports.getAllInventory = catchAsyncErrors(async (req, res, next) => {
     query.variantId = variantId;
   }
 
+  if (regionId) {
+    // Older stock rows may not have copied regionId when they were created.
+    // Resolve those rows from the owning product variant so filtering remains
+    // consistent with the product's current variant → region relationship.
+    const productsWithRegion = await Product.find({ 'variants.regionId': regionId }).select('variants');
+    const regionVariantIds = [];
+    productsWithRegion.forEach((product) => {
+      product.variants.forEach((variant) => {
+        if (String(variant.regionId?._id || variant.regionId || '') === regionId) {
+          regionVariantIds.push(variant._id);
+        }
+      });
+    });
+    andClauses.push(regionVariantIds.length
+      ? { variantId: { $in: regionVariantIds } }
+      : { regionId });
+  }
+
   if (size) {
     query.size = size;
   }
 
   if (color) {
-    const escaped = color.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const normalizedColor = color.trim();
+    const escaped = escapeRegex(normalizedColor);
     const colorRx = { $regex: `^${escaped}$`, $options: 'i' };
     const colorClause = { $or: [{ 'color.name': colorRx }] };
     // Also match items whose stored color is missing but whose variant has this color name
@@ -98,7 +156,7 @@ exports.getAllInventory = catchAsyncErrors(async (req, res, next) => {
     const colorVariantIds = [];
     productsWithColor.forEach(p => {
       p.variants.forEach(v => {
-        if (v.colorName && v.colorName.toLowerCase() === color.toLowerCase()) colorVariantIds.push(v._id);
+        if (v.colorName && v.colorName.toLowerCase() === normalizedColor.toLowerCase()) colorVariantIds.push(v._id);
       });
     });
     if (colorVariantIds.length > 0) colorClause.$or.push({ variantId: { $in: colorVariantIds } });
@@ -109,13 +167,15 @@ exports.getAllInventory = catchAsyncErrors(async (req, res, next) => {
     query.$and = andClauses;
   }
   
-  const skip = (page - 1) * limit;
+  const effectiveLimit = Math.min(limitNum, 100);
+  const skip = (pageNum - 1) * effectiveLimit;
   
   const inventory = await Inventory.find(query)
-    .populate('productId', 'name mainImage mainPrice variants')
+    .populate({ path: 'regionId', select: 'name' })
+    .populate({ path: 'productId', select: 'name mainImage mainPrice variants', populate: { path: 'variants.regionId', select: 'name' } })
     .sort({ createdAt: -1 })
     .skip(skip)
-    .limit(parseInt(limit));
+    .limit(effectiveLimit);
   
   // Attach variant information to each inventory item
   const inventoryWithVariants = inventory.map(item => enrichInventoryItem(item.toObject()));
@@ -126,10 +186,10 @@ exports.getAllInventory = catchAsyncErrors(async (req, res, next) => {
     success: true,
     inventory: inventoryWithVariants,
     pagination: {
-      page: parseInt(page),
-      limit: parseInt(limit),
+      page: pageNum,
+      limit: effectiveLimit,
       total,
-      totalPages: Math.ceil(total / limit)
+      totalPages: Math.ceil(total / effectiveLimit)
     }
   });
 });
@@ -137,7 +197,8 @@ exports.getAllInventory = catchAsyncErrors(async (req, res, next) => {
 // Get inventory by ID
 exports.getInventoryById = catchAsyncErrors(async (req, res, next) => {
   const inventory = await Inventory.findById(req.params.id)
-    .populate('productId', 'name mainImage mainPrice variants');
+    .populate({ path: 'regionId', select: 'name' })
+    .populate({ path: 'productId', select: 'name mainImage mainPrice variants', populate: { path: 'variants.regionId', select: 'name' } });
   
   if (!inventory) {
     return next(new ErrorHandler('Inventory not found', 404));
@@ -151,10 +212,10 @@ exports.getInventoryById = catchAsyncErrors(async (req, res, next) => {
 
 // Create new inventory item
 exports.createInventory = catchAsyncErrors(async (req, res, next) => {
-  const { productId, variantId, size, stockQuantity, location, notes, price, discountPrice } = req.body;
+  const { productId, variantId, regionId, realBarcode, size, stockQuantity, location, notes, price, discountPrice, costPrice } = req.body;
   
   // Validate product and variant
-  const product = await Product.findById(productId);
+  const product = await Product.findById(productId).populate('variants.regionId', 'name');
   if (!product) {
     return next(new ErrorHandler('Product not found', 404));
   }
@@ -162,6 +223,11 @@ exports.createInventory = catchAsyncErrors(async (req, res, next) => {
   const variant = product.variants.find(v => v._id.toString() === variantId);
   if (!variant) {
     return next(new ErrorHandler('Product variant not found', 404));
+  }
+
+  const variantRegionId = variant.regionId?._id || variant.regionId || null;
+  if (regionId && String(regionId) !== String(variantRegionId || '')) {
+    return next(new ErrorHandler('Selected region does not match the product variant', 400));
   }
   
   // Check if size exists in variant
@@ -209,14 +275,18 @@ exports.createInventory = catchAsyncErrors(async (req, res, next) => {
   const inventory = await Inventory.create({
     productId,
     variantId,
+    regionId: variant.regionId?._id || variant.regionId || null,
+    regionName: variant.regionId?.name || '',
     size,
     barcode,
+    realBarcode: String(realBarcode || '').trim(),
     qrCode,
     stockQuantity: 1, // Each inventory item represents exactly 1 individual item
     availableQuantity: 1,
     assignedQuantity: 0,
     price: variantPrice,
     discountPrice: variantDiscountPrice,
+    costPrice: costPrice !== undefined && costPrice !== '' ? Number(costPrice) : (variant.options?.find(option => String(option.size).trim().toLowerCase() === String(size).trim().toLowerCase())?.costPrice ?? variant.costPrice ?? product.costPrice ?? null),
     imageUri: variant.images?.[0]?.url || variant.images?.[0] || null,
     color: {
       name: variant.colorName || 'Default',
@@ -235,7 +305,7 @@ exports.createInventory = catchAsyncErrors(async (req, res, next) => {
 
 // Update inventory item
 exports.updateInventory = catchAsyncErrors(async (req, res, next) => {
-  const { stockQuantity, location, notes, status, price, discountPrice } = req.body;
+  const { stockQuantity, location, notes, status, price, discountPrice, costPrice, realBarcode } = req.body;
   
   const inventory = await Inventory.findById(req.params.id);
   if (!inventory) {
@@ -249,6 +319,8 @@ exports.updateInventory = catchAsyncErrors(async (req, res, next) => {
   if (status) inventory.status = status;
   if (price !== undefined) inventory.price = price;
   if (discountPrice !== undefined) inventory.discountPrice = discountPrice;
+  if (costPrice !== undefined) inventory.costPrice = costPrice === null || costPrice === '' ? null : Number(costPrice);
+  if (realBarcode !== undefined) inventory.realBarcode = String(realBarcode || '').trim();
   
   await inventory.save();
   
@@ -265,6 +337,10 @@ exports.deleteInventory = catchAsyncErrors(async (req, res, next) => {
   if (!inventory) {
     return next(new ErrorHandler('Inventory not found', 404));
   }
+
+  if (inventory.assignedQuantity > 0) {
+    return next(new ErrorHandler('Assigned inventory cannot be deleted. Release it from its order first.', 409));
+  }
   
   await Inventory.findByIdAndDelete(req.params.id);
   
@@ -274,21 +350,64 @@ exports.deleteInventory = catchAsyncErrors(async (req, res, next) => {
   });
 });
 
+// Delete a selection in one request so large selections do not overwhelm the API.
+exports.deleteInventoryBulk = catchAsyncErrors(async (req, res, next) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > 500) {
+    return next(new ErrorHandler('Provide between 1 and 500 inventory IDs', 400));
+  }
+
+  const uniqueIds = [...new Set(ids.map((id) => String(id)))];
+  if (uniqueIds.some((id) => !mongoose.Types.ObjectId.isValid(id))) {
+    return next(new ErrorHandler('One or more inventory IDs are invalid', 400));
+  }
+
+  const result = await Inventory.deleteMany({
+    _id: { $in: uniqueIds },
+    $or: [
+      { assignedQuantity: { $lte: 0 } },
+      { assignedQuantity: { $exists: false } },
+    ],
+  });
+  const remaining = await Inventory.countDocuments({
+    _id: { $in: uniqueIds },
+    assignedQuantity: { $gt: 0 },
+  });
+
+  return res.status(200).json({
+    success: true,
+    deletedCount: result.deletedCount || 0,
+    skippedCount: remaining,
+    message: remaining
+      ? `Deleted ${result.deletedCount || 0} item(s); ${remaining} assigned item(s) were kept.`
+      : `Deleted ${result.deletedCount || 0} inventory item(s) successfully.`,
+  });
+});
+
 // Scan barcode/QR code
 const PROJ = 'name mainImage mainPrice variants sku';
 
-// Resolve a scanned/typed code: exact barcode → exact qrCode → product SKU (first available unit)
+// Resolve a scanned/typed code: generated barcode → product barcode → QR → product SKU.
 const findInventoryByCode = async (code) => {
   const c = String(code).trim();
   let inventory = await Inventory.findOne({ $or: [{ barcode: c }, { qrCode: c }] })
-    .populate('productId', PROJ);
+    .populate({ path: 'regionId', select: 'name' })
+    .populate({ path: 'productId', select: PROJ, populate: { path: 'variants.regionId', select: 'name' } });
+
+  if (!inventory) {
+    inventory = await Inventory.findOne({ realBarcode: c, availableQuantity: { $gt: 0 }, status: 'active' })
+      .sort({ createdAt: 1 })
+      .populate({ path: 'regionId', select: 'name' })
+      .populate({ path: 'productId', select: PROJ, populate: { path: 'variants.regionId', select: 'name' } });
+  }
 
   if (!inventory) {
     const escaped = c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const product = await Product.findOne({ sku: { $regex: `^${escaped}$`, $options: 'i' } }).select('_id');
     if (product) {
       inventory = await Inventory.findOne({ productId: product._id, availableQuantity: { $gt: 0 } })
-        .populate('productId', PROJ);
+        .populate({ path: 'regionId', select: 'name' })
+        .populate({ path: 'productId', select: PROJ, populate: { path: 'variants.regionId', select: 'name' } });
     }
   }
   return inventory;
@@ -353,9 +472,9 @@ exports.getInventoryStats = catchAsyncErrors(async (req, res, next) => {
 
 // Bulk create inventory from product variants
 exports.bulkCreateFromProduct = catchAsyncErrors(async (req, res, next) => {
-  const { productId, stockQuantities } = req.body;
+  const { productId, stockQuantities, realBarcodes = {} } = req.body;
   
-  const product = await Product.findById(productId);
+  const product = await Product.findById(productId).populate('variants.regionId', 'name');
   if (!product) {
     return next(new ErrorHandler('Product not found', 404));
   }
@@ -381,13 +500,17 @@ exports.bulkCreateFromProduct = catchAsyncErrors(async (req, res, next) => {
                   const inventory = await Inventory.create({
           productId,
           variantId: variant._id,
+          regionId: variant.regionId?._id || variant.regionId || null,
+          regionName: variant.regionId?.name || '',
           size,
           barcode,
+          realBarcode: String(realBarcodes?.[variant._id]?.[size] || '').trim(),
           qrCode,
           stockQuantity: 1,
           availableQuantity: 1,
           assignedQuantity: 0,
           price: variant.prices?.[0] || product.mainPrice,
+          costPrice: variant.costPrice ?? product.costPrice ?? null,
           imageUri: variant.images?.[0]?.url || variant.images?.[0] || null,
           color: {
             name: variant.colorName || 'Default',
@@ -421,10 +544,10 @@ exports.bulkCreate = catchAsyncErrors(async (req, res, next) => {
   
   for (const item of inventoryItems) {
     try {
-      const { productId, variantId, size, stockQuantity, location, notes, price, discountPrice } = item;
+      const { productId, variantId, regionId, realBarcode, size, stockQuantity, location, notes, price, discountPrice, costPrice } = item;
       
       // Validate product and variant
-      const product = await Product.findById(productId);
+      const product = await Product.findById(productId).populate('variants.regionId', 'name');
       if (!product) {
         errors.push(`Product not found for item: ${productId}`);
         continue;
@@ -433,6 +556,12 @@ exports.bulkCreate = catchAsyncErrors(async (req, res, next) => {
       const variant = product.variants.find(v => v._id.toString() === variantId);
       if (!variant) {
         errors.push(`Variant not found for product: ${productId}, variant: ${variantId}`);
+        continue;
+      }
+
+      const variantRegionId = variant.regionId?._id || variant.regionId || null;
+      if (regionId && String(regionId) !== String(variantRegionId || '')) {
+        errors.push(`Selected region does not match variant: ${variantId}`);
         continue;
       }
       
@@ -486,12 +615,16 @@ exports.bulkCreate = catchAsyncErrors(async (req, res, next) => {
         const inventory = await Inventory.create({
           productId,
           variantId,
+          regionId: variant.regionId?._id || variant.regionId || null,
+          regionName: variant.regionId?.name || '',
           size,
           barcode,
+          realBarcode: String(realBarcode || '').trim(),
           qrCode,
           stockQuantity: 1, // Each item represents 1 unit
           price: variantPrice,
           discountPrice: variantDiscountPrice,
+          costPrice: costPrice !== undefined && costPrice !== '' ? Number(costPrice) : (variant.options?.find(option => String(option.size).trim().toLowerCase() === String(size).trim().toLowerCase())?.costPrice ?? variant.costPrice ?? product.costPrice ?? null),
           imageUri: variant.images?.[0]?.url || variant.images?.[0] || null,
           color: {
             name: variant.colorName || 'Default',
@@ -526,7 +659,7 @@ exports.generatePrintCodes = catchAsyncErrors(async (req, res, next) => {
   
   const inventory = await Inventory.find({
     _id: { $in: inventoryIds }
-  }).populate('productId', 'name mainPrice variants');
+  }).populate({ path: 'productId', select: 'name mainPrice variants', populate: { path: 'variants.regionId', select: 'name' } });
   
   if (inventory.length === 0) {
     return next(new ErrorHandler('No inventory items found', 404));
@@ -548,7 +681,9 @@ exports.generatePrintCodes = catchAsyncErrors(async (req, res, next) => {
           sizes: variant.sizes,
           prices: variant.prices,
           measureType: variant.measureType,
-          unitName: variant.unitName
+          unitName: variant.unitName,
+          regionId: variant.regionId?._id || variant.regionId || null,
+          regionName: variant.regionId?.name || item.regionName || ''
         };
       }
     }
@@ -558,10 +693,13 @@ exports.generatePrintCodes = catchAsyncErrors(async (req, res, next) => {
       codes.push({
         id: item._id,
         barcode: item.barcode,
+        realBarcode: item.realBarcode || '',
         qrCode: item.qrCode,
         productName: item.productId.name,
         price: item.discountPrice || item.price || item.productId.mainPrice,
         size: item.size,
+        regionId: variantInfo?.regionId || item.regionId || null,
+        regionName: variantInfo?.regionName || item.regionName || '',
         measureType: variantInfo?.measureType,
         unitName: variantInfo?.unitName,
         stockQuantity: item.stockQuantity,
@@ -652,7 +790,9 @@ exports.getInventoryBatch = catchAsyncErrors(async (req, res, next) => {
 
   const inventory = await Inventory.find({
     _id: { $in: validIds }
-  }).populate('productId', 'name mainImage mainPrice variants');
+  })
+    .populate({ path: 'regionId', select: 'name' })
+    .populate({ path: 'productId', select: 'name mainImage mainPrice variants', populate: { path: 'variants.regionId', select: 'name' } });
 
   if (inventory.length === 0) {
     return next(new ErrorHandler('No inventory items found', 404));

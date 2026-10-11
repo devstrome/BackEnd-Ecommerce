@@ -2,23 +2,129 @@ const Order = require('../models/Order');
 const User = require('../models/User');
 const Inventory = require('../models/Inventory');
 const Product = require('../models/Product');
+const Cart = require('../models/Cart');
+const DigitalProductCode = require('../models/DigitalProductCode');
 const mongoose = require('mongoose');
 const { 
   assignInventoryToOrder, 
   releaseInventoryFromOrder, 
   validateInventoryAvailability 
 } = require('../utils/inventoryHelpers');
-const { sendOrderConfirmation, sendOrderProcessing, sendOrderShipped, sendOrderDelivered, sendOrderCancelled, sendOrderFinalization } = require('../utils/emailService');
+const { sendOrderConfirmation, sendOrderProcessing, sendOrderShipped, sendOrderDelivered, sendOrderCancelled, sendOrderFinalization, sendOrderInvoicePdf } = require('../utils/emailService');
+const { createOrderInvoicePdf } = require('../utils/orderInvoicePdf');
+const { ownsOrder, customerOrdersFilter } = require('../utils/orderAccess');
+const escapeRegex = require('../utils/escapeRegex');
+const DIGITAL_FREE_SHIPPING_NAME = 'Digital Products — Free Delivery';
+const {
+  getLoyaltyAccount,
+  getLoyaltySettings,
+  changeLoyaltyBalance,
+  earnOrderReward,
+  encryptDigitalCode,
+  reserveDigitalCodesForOrder,
+  releaseDigitalCodesForOrder,
+  sendOrderDigitalCodes,
+  readManualDigitalFulfillment,
+  sendOrderManualDigitalFulfillment,
+} = require('../utils/loyaltyService');
+
+const reverseOrderLoyalty = async (order, session = null) => {
+  if (!order?.userId) return;
+  if (Number(order.loyaltyAmountUsed || 0) > 0) {
+    await changeLoyaltyBalance({
+      userId: order.userId,
+      amountBDT: order.loyaltyAmountUsed,
+      direction: 'credit',
+      source: 'order_refund',
+      referenceId: order.orderId,
+      note: `Restored loyalty balance for cancelled, refunded, or deleted order #${order.orderId}`,
+      idempotencyKey: `order:${order._id}:loyalty-restore`,
+      session,
+    });
+  }
+  if (Number(order.loyaltyRewardEarned || 0) > 0) {
+    await changeLoyaltyBalance({
+      userId: order.userId,
+      amountBDT: order.loyaltyRewardEarned,
+      direction: 'debit',
+      source: 'reward_reversal',
+      referenceId: order.orderId,
+      note: `Reversed loyalty reward for cancelled, refunded, or deleted order #${order.orderId}`,
+      idempotencyKey: `order:${order._id}:reward-reversal`,
+      session,
+      allowNegative: true,
+    });
+  }
+};
 
 // Socket.io instance (set from server.js)
 let ioInstance = null;
+
+async function hydrateFinanceItemSnapshots(items, session = null) {
+  const sourceItems = (items || []).map((item) => typeof item?.toObject === 'function' ? item.toObject() : { ...item });
+  const productIds = [...new Set(sourceItems.map((item) => String(item.productId?._id || item.productId || '')).filter(mongoose.isValidObjectId))];
+  if (!productIds.length) return sourceItems;
+  let query = Product.find({ _id: { $in: productIds } }).select('name slug sku brand categories mainImage costPrice isDigitalProduct variants');
+  if (session) query = query.session(session);
+  const products = await query.lean();
+  const byId = new Map(products.map((product) => [String(product._id), product]));
+  return sourceItems.map((item) => {
+    const product = byId.get(String(item.productId?._id || item.productId || ''));
+    if (!product) return item;
+    const variant = (product.variants || []).find((entry) => String(entry._id) === String(item.variantId?._id || item.variantId || ''));
+    const configuration = item.configuration || {};
+    const same = (left, right) => String(left || '').trim().toLowerCase() === String(right || '').trim().toLowerCase();
+    const option = (variant?.options || []).find((entry) =>
+      same(entry.size, configuration.size || item.size) &&
+      same(entry.measureType, configuration.measureType || item.measureType) &&
+      same(entry.unitName, configuration.unitName || item.unitName)
+    );
+    const color = configuration.color || item.color || variant?.colorName || '';
+    const size = configuration.size || item.size || '';
+    const variantName = item.variantName || [color, size].filter(Boolean).join(' / ');
+    const fallbackCost = option?.costPrice ?? variant?.costPrice ?? product.costPrice;
+    return {
+      ...item,
+      productSlug: item.productSlug || product.slug || '',
+      brand: item.brand || product.brand || '',
+      categories: item.categories?.length ? item.categories : product.categories || [],
+      variantName,
+      variantImage: item.variantImage || variant?.images?.[0] || item.mainImage || '',
+      hexCode: item.hexCode || configuration.hexCode || variant?.hexCode || '',
+      costPrice: item.costPrice ?? (fallbackCost !== null && fallbackCost !== undefined && Number.isFinite(Number(fallbackCost)) ? Number(fallbackCost) : null),
+      isDigitalProduct: Boolean(item.isDigitalProduct || product.isDigitalProduct),
+    };
+  });
+}
+
+// Older orders may predate the digital-product flag on each line item. Use the
+// current catalog flag as a fallback so admin fulfillment fields and courier
+// visibility still work for those saved orders.
+async function hydrateOrderDigitalFlags(orderOrOrders) {
+  const input = Array.isArray(orderOrOrders) ? orderOrOrders : [orderOrOrders];
+  const orders = input.filter(Boolean).map((order) => typeof order.toObject === 'function' ? order.toObject() : order);
+  const productIds = [...new Set(orders.flatMap((order) => (order.items || [])
+    .map((item) => String(item.productId?._id || item.productId || ''))
+    .filter(mongoose.isValidObjectId)))];
+  if (!productIds.length) return Array.isArray(orderOrOrders) ? orders : orders[0] || null;
+  const products = await Product.find({ _id: { $in: productIds } }).select('isDigitalProduct').lean();
+  const digitalProducts = new Set(products.filter((product) => product.isDigitalProduct).map((product) => String(product._id)));
+  const hydrated = orders.map((order) => ({
+    ...order,
+    items: (order.items || []).map((item) => ({
+      ...item,
+      isDigitalProduct: Boolean(item.isDigitalProduct || digitalProducts.has(String(item.productId?._id || item.productId || ''))),
+    })),
+  }));
+  return Array.isArray(orderOrOrders) ? hydrated : hydrated[0] || null;
+}
 module.exports.setSocketIO = (io) => {
   ioInstance = io;
 };
 
 // Look up an order by its human-readable orderId OR its Mongo _id
 // (the admin UI sometimes passes _id, the user UI passes orderId)
-const findOrderByRefundKey = async (key, session) => {
+const findOrderByRefundKey = (key, session) => {
   const query = mongoose.isValidObjectId(key)
     ? Order.findOne({ $or: [{ orderId: key }, { _id: key }] })
     : Order.findOne({ orderId: key });
@@ -58,20 +164,24 @@ function emitInventoryAssignment(productId, variantId, size, action, data = {}) 
 function notifyOrderUpdate(order, eventType) {
   if (!ioInstance) return;
 
+  // `userId` may be populated by callers, so always derive the raw id before
+  // constructing the authenticated customer's private socket room/event name.
+  const orderUserId = order.userId?._id || order.userId;
+
   const events = {
     create: {
       admin: 'admin:newOrder',
-      user: `user:orderUpdate:${order.userId}`,
+      user: orderUserId ? `user:orderUpdate:${orderUserId}` : null,
       dashboard: 'newOrder'
     },
     update: {
       admin: 'admin:updateOrder',
-      user: `user:orderUpdate:${order.userId}`,
+      user: orderUserId ? `user:orderUpdate:${orderUserId}` : null,
       dashboard: 'orderStatusUpdate'
     },
     cancel: {
       admin: 'admin:cancelOrder',
-      user: `user:orderUpdate:${order.userId}`,
+      user: orderUserId ? `user:orderUpdate:${orderUserId}` : null,
       dashboard: 'orderStatusUpdate'
     },
     delete: {
@@ -91,6 +201,7 @@ function notifyOrderUpdate(order, eventType) {
       orderId: order.orderId,
       userId: order.userId,
       orderStatus: order.orderStatus,
+      isNewForAdmin: !!order.isNewForAdmin,
       paymentStatus: order.paymentStatus,
       refundStatus: order.refundStatus,
       totalAmount: order.totalAmount,
@@ -98,6 +209,38 @@ function notifyOrderUpdate(order, eventType) {
       updatedAt: order.updatedAt
     };
     ioInstance.to('adminRoom').emit(event.admin, cleanOrderForSocket);
+
+    // Rich order alerts are sent only to admins whose role includes order
+    // access. The compact update above remains for existing real-time tables.
+    const shippingAddress = order.shippingAddress || {};
+    const notificationItems = (order.items || []).map((item) => ({
+      name: item.name || 'Product',
+      quantity: Number(item.quantity) || 1,
+      price: Number(item.price) || 0,
+      variantName: item.variantName || '',
+      color: item.color || item.configuration?.color || '',
+      size: item.size || item.configuration?.size || '',
+      regionName: item.regionName || item.configuration?.regionName || '',
+      image: item.mainImage || item.variantImage || '',
+    }));
+    ioInstance.to('adminOrdersRoom').emit('admin:orderNotification', {
+      eventType,
+      _id: order._id,
+      orderId: order.orderId,
+      orderStatus: order.orderStatus,
+      paymentStatus: order.paymentStatus,
+      paymentMethod: order.paymentMethod,
+      totalAmount: order.totalAmount,
+      grandTotal: order.grandTotal,
+      shippingCost: order.shippingCost,
+      customerName: shippingAddress.fullName || '',
+      customerPhone: shippingAddress.phone || '',
+      shippingAddress: [shippingAddress.address, shippingAddress.city, shippingAddress.state, shippingAddress.postalCode, shippingAddress.country].filter(Boolean).join(', '),
+      firstItemImage: notificationItems[0]?.image || '',
+      items: notificationItems,
+      createdAt: order.createdAt,
+      updatedAt: order.updatedAt,
+    });
   }
 
   // Notify dashboard
@@ -119,8 +262,8 @@ function notifyOrderUpdate(order, eventType) {
   }
 
   // Notify specific user
-  if (event.user && order.userId) {
-    ioInstance.to(`user_${order.userId}`).emit(event.user, {
+  if (event.user && orderUserId) {
+    ioInstance.to(`user_${orderUserId}`).emit(event.user, {
       eventType,
       order
     });
@@ -168,9 +311,30 @@ module.exports.getAllOrders = async (req, res) => {
       refundStatus,
     } = req.query;
 
-    const pageNum = Math.max(parseInt(page, 10) || 1, 1);
-    const limitNum = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+    const stringFilters = [sortBy, sortOrder, status, paymentStatus, userId, orderId, q, from, to, isActive, refundStatus];
+    if (stringFilters.some((value) => value !== undefined && typeof value !== 'string')) {
+      return res.status(400).json({ message: 'Order filters must be single string values' });
+    }
+    if (!/^\d+$/.test(String(page)) || !/^\d+$/.test(String(limit))) {
+      return res.status(400).json({ message: 'Page and limit must be positive integers' });
+    }
+
+    const parsedPage = Number(page);
+    const parsedLimit = Number(limit);
+    if (!Number.isSafeInteger(parsedPage) || parsedPage < 1 || parsedPage > 10000000 ||
+        !Number.isSafeInteger(parsedLimit) || parsedLimit < 1) {
+      return res.status(400).json({ message: 'Page and limit are outside the supported range' });
+    }
+    const pageNum = parsedPage;
+    const limitNum = Math.min(parsedLimit, 100);
     const skip = (pageNum - 1) * limitNum;
+
+    if (sortOrder !== 'asc' && sortOrder !== 'desc') {
+      return res.status(400).json({ message: 'sortOrder must be asc or desc' });
+    }
+    const allowedSortFields = new Set(['createdAt', 'updatedAt', 'orderId', 'orderStatus', 'paymentStatus', 'totalAmount']);
+    const safeSortBy = allowedSortFields.has(sortBy) ? sortBy : 'createdAt';
+    if (q && q.length > 100) return res.status(400).json({ message: 'Search query must be 100 characters or fewer' });
 
     // Base filter
     const filter = {};
@@ -219,13 +383,21 @@ module.exports.getAllOrders = async (req, res) => {
     // Date range
     if (from || to) {
       filter.createdAt = {};
-      if (from) filter.createdAt.$gte = new Date(from);
-      if (to) filter.createdAt.$lte = new Date(to);
+      if (from) {
+        const fromDate = new Date(from);
+        if (Number.isNaN(fromDate.getTime())) return res.status(400).json({ message: 'Invalid from date' });
+        filter.createdAt.$gte = fromDate;
+      }
+      if (to) {
+        const toDate = new Date(to);
+        if (Number.isNaN(toDate.getTime())) return res.status(400).json({ message: 'Invalid to date' });
+        filter.createdAt.$lte = toDate;
+      }
     }
 
     // Free-text search
     if (q && q.trim()) {
-      const rx = new RegExp(q.trim(), 'i');
+      const rx = new RegExp(escapeRegex(q.trim().slice(0, 100)), 'i');
       filter.$or = [
         { orderId: rx },
         { couponCode: rx },
@@ -235,17 +407,34 @@ module.exports.getAllOrders = async (req, res) => {
     }
 
     // Sorting
-    const sort = { [sortBy]: sortOrder === 'asc' ? 1 : -1 };
+    const sort = { [safeSortBy]: sortOrder === 'asc' ? 1 : -1 };
 
     // Query + total
-    const [orders, total] = await Promise.all([
-      Order.find(filter)
-        .sort(sort)
-        .skip(skip)
-        .limit(limitNum)
-        .lean(),
+    let ordersQuery = Order.find(filter)
+      .sort(sort)
+      .skip(skip)
+      .limit(limitNum)
+      .populate('items.regionId', 'name');
+    if (isAdmin) {
+      ordersQuery = ordersQuery.populate({
+          path: 'items.assignedInventoryItems',
+          select: 'barcode realBarcode qrCode imageUri size color regionId regionName variantId productId',
+          populate: [
+            { path: 'regionId', select: 'name' },
+            { path: 'productId', select: 'name mainImage' },
+          ],
+      });
+    } else {
+      ordersQuery = ordersQuery.select(
+        '-items.costPrice -items.assignedInventoryItems -items.assignedInventorySnapshots -items.digitalCodeIds -items.inventoryId -items.manualDigitalFulfillmentEncrypted'
+      );
+    }
+
+    let [orders, total] = await Promise.all([
+      ordersQuery.lean(),
       Order.countDocuments(filter),
     ]);
+    if (isAdmin) orders = await hydrateOrderDigitalFlags(orders);
 
     return res.json({
       data: orders,
@@ -276,26 +465,42 @@ module.exports.getAllOrders = async (req, res) => {
   }
 };
 
+module.exports.markOrderOpened = async (req, res) => {
+  try {
+    const order = await findOrderByRefundKey(req.params.orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+
+    if (order.isNewForAdmin) {
+      order.isNewForAdmin = false;
+      await order.save();
+    }
+
+    return res.json({ success: true, orderId: order._id, isNewForAdmin: false });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message || 'Unable to mark order as opened' });
+  }
+};
+
 module.exports.createOrder = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
     const {
-      userId,
-      items,
-      totalAmount,
-      discountAmount,
-      couponCode,
       shippingAddress,
       shipping,
       paymentMethod,
       paymentDetails,
       selectedPaymentMethodId,
+      loyaltyAmountBDT = 0,
     } = req.body;
 
-    if (!userId || !items || !Array.isArray(items) || items.length === 0 ||
-      !totalAmount || !shippingAddress || !paymentMethod) {
+    const userId = req.user?._id?.toString();
+    if (!userId || (req.body.userId && req.body.userId.toString() !== userId)) {
+      await session.abortTransaction();
+      return res.status(403).json({ message: 'The authenticated account does not match this checkout' });
+    }
+    if (!shippingAddress || !shipping?.name) {
       await session.abortTransaction();
       return res.status(400).json({ message: 'Missing required fields' });
     }
@@ -309,17 +514,6 @@ module.exports.createOrder = async (req, res) => {
       }
     }
 
-    // Validate items
-    for (const item of items) {
-      if (!item.variantId || !item.productId || !item.name ||
-        typeof item.discountApplied !== 'number' ||
-        !item.quantity || !item.price || !item.mainImage ||
-        !item.measureType || !item.unitName) {
-        await session.abortTransaction();
-        return res.status(400).json({ message: 'Each item must include required fields' });
-      }
-    }
-
     // Verify user exists
     const user = await User.findById(userId).session(session).lean();
     if (!user) {
@@ -327,17 +521,77 @@ module.exports.createOrder = async (req, res) => {
       return res.status(404).json({ message: 'User not found' });
     }
 
+    // The persisted server cart is authoritative. Re-resolve every option,
+    // price, discount, and stock level before creating the order snapshot.
+    const { refreshCartFromCatalog, recalcCartWithCoupon } = require('./CartController');
+    const cart = await Cart.findOne({ userId }).populate('couponId').session(session);
+    if (!cart || !cart.items.length) {
+      await session.abortTransaction();
+      return res.status(400).json({ message: 'Your cart is empty. Add items before placing the order.' });
+    }
+    await refreshCartFromCatalog(cart);
+    await recalcCartWithCoupon(cart);
+    const unavailableItems = cart.items.filter((item) => !item.isAvailable);
+    if (unavailableItems.length) {
+      await cart.save({ session });
+      await session.commitTransaction();
+      return res.status(409).json({
+        message: 'Some cart items have changed or are unavailable. Review your cart and try again.',
+        items: unavailableItems.map((item) => ({ itemId: item._id, message: item.unavailableReason })),
+      });
+    }
+    const items = await hydrateFinanceItemSnapshots(cart.items.map((item) => ({
+      productId: item.productId,
+      variantId: item.variantId || null,
+      regionId: item.regionId || null,
+      regionName: item.regionName || '',
+      configuration: {
+        regionId: item.regionId || null,
+        regionName: item.regionName || '',
+        color: item.color || '',
+        hexCode: item.hexCode || '',
+        size: item.size || '',
+        measureType: item.measureType || '',
+        unitName: item.unitName || '',
+      },
+      name: item.name,
+      sku: item.sku || '',
+      quantity: Number(item.quantity),
+      price: Number(item.price),
+      originalPrice: Number(item.originalPrice ?? item.price),
+      discountPrice: item.discountPrice ?? null,
+      discountApplied: Number(item.discountApplied || 0),
+      mainImage: item.mainImage || '',
+      variantImage: item.mainImage || '',
+      size: item.size || '',
+      color: item.color || '',
+      measureType: item.measureType || '',
+      unitName: item.unitName || '',
+      isPreOrder: Boolean(item.isPreOrder),
+      isDigitalProduct: Boolean(item.isDigitalProduct),
+      preOrderEstimatedDate: item.preOrderEstimatedDate || null,
+    })), session);
+    const totalAmount = Number(cart.totalAmount || 0);
+    const discountAmount = Number(cart.discountAmount || 0);
+    const couponCode = cart.couponId?.code || null;
+    const hasDigitalProducts = items.some((item) => item.isDigitalProduct);
 
 
-    // Handle payment method
-    let selectedPaymentMethod;
-    if (paymentMethod.toLowerCase() === 'cash on delivery' || paymentMethod.toLowerCase() === 'cash') {
+
+    // Resolve the selected tender. Its requirement is checked after the server
+    // calculates shipping and the amount the loyalty balance will cover.
+    let selectedPaymentMethod = null;
+    const requestedPaymentMethod = String(paymentMethod || '').trim();
+    const requestedPaymentKey = requestedPaymentMethod.toLowerCase();
+    if (['loyalty balance', 'loyalty'].includes(requestedPaymentKey)) {
+      selectedPaymentMethod = { methodId: 'loyalty', type: 'Loyalty Balance', label: 'Loyalty Balance' };
+    } else if (requestedPaymentKey === 'cash on delivery' || requestedPaymentKey === 'cash') {
       selectedPaymentMethod = {
         methodId: 'cash',
         type: 'Cash on Delivery',
         label: 'Cash on Delivery',
       };
-    } else {
+    } else if (requestedPaymentMethod) {
       const method = (user.paymentMethods || []).find(
         m => m._id.toString() === selectedPaymentMethodId
       );
@@ -353,45 +607,48 @@ module.exports.createOrder = async (req, res) => {
       };
     }
 
-    const normalizedPaymentMethod = paymentMethod.toLowerCase() === 'cash on delivery'
-      ? 'Cash on Delivery'
-      : paymentMethod;
+    let normalizedPaymentMethod = selectedPaymentMethod?.type || requestedPaymentMethod;
 
     // Validate shipping information
-    if (!shipping || !shipping.name || typeof shipping.charge !== 'number') {
+    if (!shipping || !shipping.name) {
       await session.abortTransaction();
       return res.status(400).json({ message: 'Valid shipping information is required' });
     }
 
-    // Verify shipping method exists and is active
-    const Shipping = require('../models/Shipping');
-    const shippingMethod = await Shipping.findOne({ 
-      name: shipping.name, 
-      isActive: true 
-    }).session(session);
-    
-    if (!shippingMethod) {
-      await session.abortTransaction();
-      return res.status(400).json({ message: 'Selected shipping method is not available' });
+    const isDigitalOnlyOrder = items.length > 0 && items.every((item) => Boolean(item.isDigitalProduct));
+    let orderShipping;
+    if (isDigitalOnlyOrder) {
+      if (shipping.name !== DIGITAL_FREE_SHIPPING_NAME) {
+        await session.abortTransaction();
+        return res.status(400).json({ message: 'Digital-only orders use Free Delivery and do not need a courier method' });
+      }
+      orderShipping = { name: DIGITAL_FREE_SHIPPING_NAME, charge: 0, estimatedDays: 0 };
+    } else {
+      // Physical and mixed carts must use an active, server-configured method.
+      const Shipping = require('../models/Shipping');
+      const shippingMethod = await Shipping.findOne({ name: shipping.name, isActive: true }).session(session);
+      if (!shippingMethod) {
+        await session.abortTransaction();
+        return res.status(400).json({ message: 'Selected shipping method is not available' });
+      }
+      orderShipping = {
+        name: shippingMethod.name,
+        charge: shippingMethod.charge,
+        estimatedDays: shippingMethod.estimatedDays,
+      };
     }
-
-    // Use shipping method data for consistency
-    const orderShipping = {
-      name: shippingMethod.name,
-      charge: shippingMethod.charge,
-      estimatedDays: shippingMethod.estimatedDays,
-    };
 
     // Apply admin-configured checkout rules (min/max order, COD limits, delivery multiplier, fees...)
     const { evaluateCheckoutRules } = require('../utils/checkoutRuleEngine');
-    const ruleEval = await evaluateCheckoutRules({
+    const checkoutRuleInput = {
       subtotal: Number(totalAmount),
       discountAmount: Number(discountAmount || 0),
       shippingCharge: orderShipping.charge,
       shippingMethodName: orderShipping.name,
       paymentMethod: normalizedPaymentMethod,
-      items: items.map(i => ({ name: i.name, quantity: Number(i.quantity) || 0 })),
-    });
+      items: items.map(i => ({ name: i.name, quantity: Number(i.quantity) || 0, price: Number(i.price) || 0, isDigitalProduct: Boolean(i.isDigitalProduct) })),
+    };
+    let ruleEval = await evaluateCheckoutRules(checkoutRuleInput);
 
     if (!ruleEval.ok) {
       await session.abortTransaction();
@@ -410,13 +667,74 @@ module.exports.createOrder = async (req, res) => {
       };
     });
 
-    // Create order
+    const requestedLoyaltyAmount = Number(loyaltyAmountBDT || 0);
+    if (!Number.isFinite(requestedLoyaltyAmount) || requestedLoyaltyAmount < 0) {
+      await session.abortTransaction();
+      return res.status(400).json({ message: 'Enter a valid BDT loyalty amount' });
+    }
+    const loyaltySettings = await getLoyaltySettings(session);
+    const loyaltyAccount = await getLoyaltyAccount(userId, session);
+    const getLoyaltyUse = (total) => Math.round(Math.min(
+      requestedLoyaltyAmount,
+      Number(loyaltyAccount.balanceBDT || 0),
+      loyaltySettings.enabled ? Number(total || 0) * Number(loyaltySettings.maxRedeemPercent || 0) / 100 : 0,
+      Number(total || 0),
+    ) * 100) / 100;
+    let loyaltyAmountUsed = getLoyaltyUse(ruleEval.grandTotal);
+    let amountDue = Math.max(0, Math.round((Number(ruleEval.grandTotal || 0) - loyaltyAmountUsed) * 100) / 100);
+
+    if (amountDue <= 0 && requestedPaymentKey !== 'loyalty balance' && requestedPaymentKey !== 'loyalty') {
+      const loyaltyRuleEval = await evaluateCheckoutRules({ ...checkoutRuleInput, paymentMethod: 'Loyalty Balance' });
+      if (!loyaltyRuleEval.ok) {
+        await session.abortTransaction();
+        return res.status(400).json({
+          message: loyaltyRuleEval.blockers.map(b => b.message).join(' '),
+          blockers: loyaltyRuleEval.blockers,
+        });
+      }
+      const loyaltyRuleUse = getLoyaltyUse(loyaltyRuleEval.grandTotal);
+      if (loyaltyRuleUse >= Number(loyaltyRuleEval.grandTotal || 0)) {
+        ruleEval = loyaltyRuleEval;
+        loyaltyAmountUsed = loyaltyRuleUse;
+        amountDue = Math.max(0, Math.round((Number(ruleEval.grandTotal || 0) - loyaltyAmountUsed) * 100) / 100);
+      }
+    }
+
+    if (amountDue > 0 && (!selectedPaymentMethod || ['loyalty', 'loyalty balance'].includes(String(selectedPaymentMethod.type).toLowerCase()))) {
+      await session.abortTransaction();
+      return res.status(400).json({ message: 'Select a payment method for the amount remaining after loyalty balance.' });
+    }
+    if (amountDue <= 0) {
+      selectedPaymentMethod = { methodId: 'loyalty', type: 'Loyalty Balance', label: 'Loyalty Balance' };
+      normalizedPaymentMethod = 'Loyalty Balance';
+    }
+
+    if (amountDue > 0 && hasDigitalProducts) {
+      const walletType = String(selectedPaymentMethod?.type || '').trim().toLowerCase();
+      const trxId = String(paymentDetails?.trxId || '').trim();
+      if (!['bkash', 'nagad'].includes(walletType)) {
+        await session.abortTransaction();
+        return res.status(400).json({ message: 'Digital products require bKash or Nagad for the amount remaining after loyalty balance.' });
+      }
+      if (walletType !== requestedPaymentKey) {
+        await session.abortTransaction();
+        return res.status(400).json({ message: 'Select the same bKash or Nagad wallet used to pay for the digital product.' });
+      }
+      if (!/^[a-z0-9]{8,}$/i.test(trxId)) {
+        await session.abortTransaction();
+        return res.status(400).json({ message: 'A valid bKash or Nagad transaction ID is required for digital products.' });
+      }
+    }
+
+    // Create the order only after loyalty and payment rules are finalized so
+    // the saved totals and wallet ledger always use the same server values.
     const orderId = await generateOrderId();
     const newOrder = new Order({
       orderId,
       userId,
       items: itemsWithInventory,
-      totalAmount, // This is the subtotal
+      isNewForAdmin: true,
+      totalAmount,
       discountAmount,
       couponCode,
       shippingAddress,
@@ -425,16 +743,40 @@ module.exports.createOrder = async (req, res) => {
       extraFees: ruleEval.extraFees,
       extraFeeTotal: ruleEval.extraFeeTotal,
       checkoutRulesApplied: ruleEval.appliedRules,
-      grandTotal: ruleEval.grandTotal, // subtotal - discount + delivery + fees
+      grandTotal: ruleEval.grandTotal,
+      amountDue,
+      loyaltyAmountUsed,
       paymentMethod: normalizedPaymentMethod,
       selectedPaymentMethod,
       paymentDetails,
-      paymentStatus: 'pending',
-      orderStatus: 'pending',
+      paymentStatus: amountDue <= 0 ? 'completed' : 'pending',
+      orderStatus: amountDue <= 0 ? 'processing' : 'pending',
       isActive: true,
     });
 
+    await newOrder.save({ session });
+    await reserveDigitalCodesForOrder(newOrder, session);
+    if (loyaltyAmountUsed > 0) {
+      await changeLoyaltyBalance({
+        userId,
+        amountBDT: loyaltyAmountUsed,
+        direction: 'debit',
+        source: 'order_redemption',
+        referenceId: newOrder.orderId,
+        note: `Loyalty balance used on order #${newOrder.orderId}`,
+        idempotencyKey: `order:${newOrder._id}:redeem`,
+        session,
+      });
+    }
+    if (newOrder.paymentStatus === 'completed') {
+      newOrder.loyaltyRewardEarned = await earnOrderReward(newOrder, session);
+    }
     const savedOrder = await newOrder.save({ session });
+    cart.items = [];
+    cart.totalAmount = 0;
+    cart.discountAmount = 0;
+    cart.couponId = null;
+    await cart.save({ session });
     await session.commitTransaction();
 
     // Notify via Socket.IO
@@ -454,6 +796,10 @@ module.exports.createOrder = async (req, res) => {
         } else {
           console.log(`⚠️ Failed to send immediate confirmation email for order #${savedOrder.orderId}: ${emailResult.message}`);
         }
+        if (savedOrder.paymentStatus === 'completed' && savedOrder.items.some((item) => item.isDigitalProduct)) {
+          const digitalResult = await sendOrderDigitalCodes(savedOrder, user);
+          if (!digitalResult.success) console.error(`Digital fulfillment email was not sent for order #${savedOrder.orderId}: ${digitalResult.message}`);
+        }
       }
     } catch (emailError) {
       console.error(`❌ Error sending immediate confirmation email for order #${savedOrder.orderId}:`, emailError.message);
@@ -466,7 +812,8 @@ module.exports.createOrder = async (req, res) => {
       await session.abortTransaction();
     }
     console.error('Create Order Error:', err);
-    return res.status(500).json({ message: err.message || 'Server error' });
+    const statusCode = err.code === 'DIGITAL_CODE_STOCK_UNAVAILABLE' ? 409 : 500;
+    return res.status(statusCode).json({ message: err.message || 'Server error', ...(statusCode === 409 ? { code: err.code } : {}) });
   } finally {
     session.endSession();
   }
@@ -568,7 +915,7 @@ module.exports.adminCreateOrder = async (req, res) => {
       shippingCharge: shippingMethod.charge,
       shippingMethodName: shippingMethod.name,
       paymentMethod: normalizedPaymentMethod,
-      items: items.map(i => ({ name: i.name, quantity: Number(i.quantity) || 0 })),
+      items: items.map(i => ({ name: i.name, quantity: Number(i.quantity) || 0, price: Number(i.price) || 0, isDigitalProduct: Boolean(i.isDigitalProduct) })),
     });
 
     // Validate status values against model enums
@@ -577,7 +924,8 @@ module.exports.adminCreateOrder = async (req, res) => {
     const finalOrderStatus = validOrderStatus.includes(orderStatus) ? orderStatus : 'pending';
     const finalPaymentStatus = validPaymentStatus.includes(paymentStatus) ? paymentStatus : 'pending';
 
-    const itemsWithInventory = items.map((item) => ({
+    const enrichedItems = await hydrateFinanceItemSnapshots(items);
+    const itemsWithInventory = enrichedItems.map((item) => ({
       ...item,
       assignedInventoryItems: [],
       inventoryAssigned: false,
@@ -588,6 +936,7 @@ module.exports.adminCreateOrder = async (req, res) => {
       orderId,
       userId,
       items: itemsWithInventory,
+      isNewForAdmin: true,
       totalAmount: subtotal,
       discountAmount: Number(discountAmount) || 0,
       couponCode,
@@ -610,7 +959,23 @@ module.exports.adminCreateOrder = async (req, res) => {
       isActive: true,
     });
 
-    const savedOrder = await newOrder.save();
+    const orderSession = await mongoose.startSession();
+    let savedOrder;
+    try {
+      orderSession.startTransaction();
+      savedOrder = await newOrder.save({ session: orderSession });
+      await reserveDigitalCodesForOrder(savedOrder, orderSession);
+      if (savedOrder.paymentStatus === 'completed') {
+        savedOrder.loyaltyRewardEarned = await earnOrderReward(savedOrder, orderSession);
+      }
+      savedOrder = await savedOrder.save({ session: orderSession });
+      await orderSession.commitTransaction();
+    } catch (persistError) {
+      if (orderSession.inTransaction()) await orderSession.abortTransaction();
+      throw persistError;
+    } finally {
+      await orderSession.endSession();
+    }
     notifyOrderUpdate(savedOrder, 'create');
 
     // Send order confirmation email (never fail order creation if email fails)
@@ -628,6 +993,11 @@ module.exports.adminCreateOrder = async (req, res) => {
       } else {
         console.warn(`⚠️ Failed to send admin order confirmation email for #${savedOrder.orderId}: ${emailResult.message || emailResult.error}`);
       }
+      if (savedOrder.paymentStatus === 'completed' && savedOrder.items.some((item) => item.isDigitalProduct)) {
+        const fulfillmentUser = { ...user, fullName: shippingAddress.fullName || user.fullName, email: recipientEmail };
+        const digitalResult = await sendOrderDigitalCodes(savedOrder, fulfillmentUser);
+        if (!digitalResult.success) console.error(`Digital fulfillment email was not sent for admin order #${savedOrder.orderId}: ${digitalResult.message}`);
+      }
     } catch (emailError) {
       console.error(`⚠️ Error sending admin order confirmation email for #${savedOrder.orderId}:`, emailError.message);
     }
@@ -640,7 +1010,8 @@ module.exports.adminCreateOrder = async (req, res) => {
     });
   } catch (err) {
     console.error('Admin Create Order Error:', err);
-    return res.status(500).json({ message: err.message || 'Server error' });
+    const statusCode = err.code === 'DIGITAL_CODE_STOCK_UNAVAILABLE' ? 409 : 500;
+    return res.status(statusCode).json({ message: err.message || 'Server error', ...(statusCode === 409 ? { code: err.code } : {}) });
   }
 };
 
@@ -649,18 +1020,51 @@ module.exports.getOrderByOrderId = async (req, res) => {
     const { orderId } = req.params;
     if (!orderId) return res.status(400).json({ message: 'Order ID required' });
 
-    const order = await Order.findOne({ orderId }).lean();
+    let order = await Order.findOne({ orderId }).select('+items.manualDigitalFulfillmentEncrypted').populate('items.regionId', 'name').lean();
     if (!order) return res.status(404).json({ message: 'Order not found' });
+    order = await hydrateOrderDigitalFlags(order);
+    if (!ownsOrder(order, req.user?._id)) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
 
     // Format items for response
-    order.items = order.items.map(item => ({
-      ...item,
-      variant: {
-        size: item.size,
-        color: item.color,
-        measureType: item.measureType,
-        unitName: item.unitName
+    order.items = await Promise.all(order.items.map(async (item) => {
+      let digitalFulfillment;
+      if (item.isDigitalProduct && order.paymentStatus === 'completed') {
+        const manualDetails = item.manualDigitalFulfillmentSentAt
+          ? readManualDigitalFulfillment(item)
+          : {};
+        const sentCodes = (item.digitalCodeIds || []).length
+          ? await DigitalProductCode.find({
+            _id: { $in: item.digitalCodeIds },
+            reservedOrderId: order._id,
+            reservedItemId: item._id,
+            status: 'sent',
+          }).select('+codeEncrypted').lean()
+          : [];
+        const decryptDigitalCode = require('../utils/loyaltyService').decryptDigitalCode;
+        const codes = sentCodes.map((record) => {
+          try {
+            return decryptDigitalCode(record.codeEncrypted);
+          } catch {
+            return '';
+          }
+        }).filter(Boolean);
+        if (Object.values(manualDetails).some(Boolean) || codes.length) {
+          digitalFulfillment = { ...manualDetails, ...(codes.length ? { codes } : {}) };
+        }
       }
+      const customerItem = { ...item };
+      [
+        'costPrice', 'assignedInventoryItems', 'assignedInventorySnapshots', 'digitalCodeIds',
+        'inventoryId', 'inventoryAssigned', 'manualDigitalFulfillmentEncrypted',
+      ].forEach((field) => delete customerItem[field]);
+      return {
+        ...customerItem,
+        variant: variantSummary(item),
+        ...(digitalFulfillment ? { digitalFulfillment } : {}),
+        manualDigitalFulfillmentEncrypted: undefined,
+      };
     }));
 
     return res.json(order);
@@ -670,11 +1074,120 @@ module.exports.getOrderByOrderId = async (req, res) => {
   }
 };
 
+module.exports.getAdminOrderByOrderId = async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    if (!orderId) return res.status(400).json({ message: 'Order ID required' });
+
+    let order = await Order.findOne({ orderId }).populate('items.regionId', 'name').lean();
+    if (!order) return res.status(404).json({ message: 'Order not found' });
+    order = await hydrateOrderDigitalFlags(order);
+    order.items = order.items.map((item) => ({ ...item, variant: variantSummary(item) }));
+    return res.json(order);
+  } catch (err) {
+    console.error('Admin get order error:', err);
+    return res.status(500).json({ message: 'Server error' });
+  }
+};
+
+const MANUAL_DIGITAL_FIELDS = ['code', 'loginId', 'username', 'password', 'pin', 'accessUrl', 'expiry', 'serialNumber', 'instructions', 'additionalDetails'];
+const normalizeManualDigitalDetails = (details = {}) => Object.fromEntries(
+  MANUAL_DIGITAL_FIELDS.map((field) => [field, String(details?.[field] ?? '').trim().slice(0, 4000)]),
+);
+const hasManualDigitalDetails = (details) => MANUAL_DIGITAL_FIELDS.some((field) => Boolean(details[field]));
+
+module.exports.getAdminDigitalFulfillment = async (req, res) => {
+  try {
+    let order = await findOrderByRefundKey(req.params.orderId).select('+items.manualDigitalFulfillmentEncrypted').lean();
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    order = await hydrateOrderDigitalFlags(order);
+    const items = (order.items || []).filter((item) => item.isDigitalProduct).map((item) => ({
+      itemId: String(item._id),
+      name: item.name,
+      variantName: item.variantName || [item.color, item.size].filter(Boolean).join(' / '),
+      quantity: Number(item.quantity) || 1,
+      details: normalizeManualDigitalDetails(readManualDigitalFulfillment(item)),
+      sentAt: item.manualDigitalFulfillmentSentAt || null,
+    }));
+    return res.json({ success: true, orderId: order.orderId, items });
+  } catch (error) {
+    console.error('Admin digital fulfillment load error:', error);
+    return res.status(500).json({ success: false, message: 'Unable to load digital delivery details' });
+  }
+};
+
+module.exports.updateAdminDigitalFulfillment = async (req, res) => {
+  try {
+    const submittedItems = req.body?.items;
+    if (!Array.isArray(submittedItems) || submittedItems.length === 0) {
+      return res.status(400).json({ success: false, message: 'Add digital delivery details for at least one item' });
+    }
+    const order = await findOrderByRefundKey(req.params.orderId).select('+items.manualDigitalFulfillmentEncrypted');
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    const hydratedOrder = await hydrateOrderDigitalFlags(order);
+    const digitalIds = new Set((hydratedOrder.items || []).filter((item) => item.isDigitalProduct).map((item) => String(item._id)));
+    const digitalItems = new Map((order.items || []).filter((item) => digitalIds.has(String(item._id))).map((item) => {
+      item.isDigitalProduct = true;
+      return [String(item._id), item];
+    }));
+    for (const submitted of submittedItems) {
+      const item = digitalItems.get(String(submitted?.itemId || ''));
+      if (!item) return res.status(400).json({ success: false, message: 'A selected order item is not a digital product in this order' });
+      const details = normalizeManualDigitalDetails(submitted.details);
+      const previous = normalizeManualDigitalDetails(readManualDigitalFulfillment(item));
+      const changed = JSON.stringify(previous) !== JSON.stringify(details);
+      item.manualDigitalFulfillmentEncrypted = hasManualDigitalDetails(details) ? encryptDigitalCode(JSON.stringify(details)) : '';
+      if (changed) item.manualDigitalFulfillmentSentAt = null;
+    }
+    await order.save();
+    return res.json({
+      success: true,
+      items: (order.items || []).filter((item) => item.isDigitalProduct).map((item) => ({
+        itemId: String(item._id),
+        details: normalizeManualDigitalDetails(readManualDigitalFulfillment(item)),
+        sentAt: item.manualDigitalFulfillmentSentAt || null,
+      })),
+    });
+  } catch (error) {
+    console.error('Admin digital fulfillment update error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Unable to save digital delivery details' });
+  }
+};
+
+module.exports.emailAdminDigitalFulfillment = async (req, res) => {
+  try {
+    const order = await findOrderByRefundKey(req.params.orderId).select('+items.manualDigitalFulfillmentEncrypted');
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    const hydratedOrder = await hydrateOrderDigitalFlags(order);
+    const digitalIds = new Set((hydratedOrder.items || []).filter((item) => item.isDigitalProduct).map((item) => String(item._id)));
+    for (const item of order.items || []) if (digitalIds.has(String(item._id))) item.isDigitalProduct = true;
+    if (order.paymentStatus !== 'completed') {
+      return res.status(409).json({ success: false, message: 'Confirm payment before emailing digital delivery details' });
+    }
+    const user = await User.findById(order.userId).select('firstName lastName fullName email');
+    const result = await sendOrderManualDigitalFulfillment(order, user);
+    if (!result.success) return res.status(502).json({ success: false, message: result.message || 'Could not email digital delivery details' });
+    return res.json({ success: true, message: `Digital delivery details emailed to ${user.email}` });
+  } catch (error) {
+    console.error('Admin digital fulfillment email error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Unable to email digital delivery details' });
+  }
+};
+
+function variantSummary(item) {
+  return {
+    size: item.size,
+    color: item.color,
+    measureType: item.measureType,
+    unitName: item.unitName,
+  };
+}
+
 module.exports.getOrders = async (req, res) => {
   try {
-    const { userId } = req.query;
-    const filter = userId && mongoose.Types.ObjectId.isValid(userId) ? { userId } : {};
-    const orders = await Order.find(filter).sort({ createdAt: -1 });
+    const filter = customerOrdersFilter(req.user?._id);
+    if (!filter) return res.status(401).json({ message: 'Login required' });
+    const orders = await Order.find(filter).populate('items.regionId', 'name').sort({ createdAt: -1 });
     return res.json(orders);
   } catch (err) {
     console.error('Get Orders Error:', err);
@@ -684,14 +1197,12 @@ module.exports.getOrders = async (req, res) => {
 
 module.exports.updateOrderStatus = async (req, res) => {
   const session = await mongoose.startSession();
-  session.startTransaction();
 
   try {
     const { orderId } = req.params;
     const { orderStatus, paymentStatus } = req.body;
 
     if (!orderId) {
-      await session.abortTransaction();
       return res.status(400).json({ message: 'Order ID required' });
     }
 
@@ -703,22 +1214,33 @@ module.exports.updateOrderStatus = async (req, res) => {
     if (paymentStatus && allowedPaymentStatuses.includes(paymentStatus)) update.paymentStatus = paymentStatus;
 
     if (Object.keys(update).length === 0) {
-      await session.abortTransaction();
       return res.status(400).json({ message: 'No valid status provided' });
     }
 
-    const updatedOrder = await Order.findOneAndUpdate(
-      { _id: orderId },
-      update,
-      { new: true, session }
-    );
+    let updatedOrder;
+    let statusChanged = false;
+    let paymentStatusChanged = false;
+    await session.withTransaction(async () => {
+      const existingOrder = await Order.findById(orderId).session(session);
+      if (!existingOrder) {
+        const notFound = new Error('Order not found');
+        notFound.statusCode = 404;
+        throw notFound;
+      }
+      statusChanged = Object.entries(update).some(([field, value]) => existingOrder[field] !== value);
+      paymentStatusChanged = Object.prototype.hasOwnProperty.call(update, 'paymentStatus') && existingOrder.paymentStatus !== update.paymentStatus;
+      existingOrder.set(update);
 
-    if (!updatedOrder) {
-      await session.abortTransaction();
-      return res.status(404).json({ message: 'Order not found' });
-    }
+      if (existingOrder.paymentStatus === 'completed') {
+        existingOrder.loyaltyRewardEarned = await earnOrderReward(existingOrder, session);
+      }
+      if (['failed', 'refunded'].includes(existingOrder.paymentStatus) || existingOrder.orderStatus === 'cancelled') {
+        await reverseOrderLoyalty(existingOrder, session);
+        await releaseDigitalCodesForOrder(existingOrder, session);
+      }
 
-    await session.commitTransaction();
+      updatedOrder = await existingOrder.save({ session });
+    });
     
     // Notify via Socket.IO
     notifyOrderUpdate(updatedOrder, 'update');
@@ -727,6 +1249,10 @@ module.exports.updateOrderStatus = async (req, res) => {
     try {
       const user = await User.findById(updatedOrder.userId).lean();
       if (user && user.email) {
+        if (updatedOrder.paymentStatus === 'completed' && updatedOrder.items.some((item) => item.isDigitalProduct)) {
+          const digitalResult = await sendOrderDigitalCodes(updatedOrder, user);
+          if (!digitalResult.success) console.error(`Digital fulfillment email was not sent for order #${updatedOrder.orderId}: ${digitalResult.message}`);
+        }
         let emailResult;
         
         if (orderStatus === 'processing' && updatedOrder.emailSent !== 'processing') {
@@ -763,6 +1289,13 @@ module.exports.updateOrderStatus = async (req, res) => {
       console.error(`❌ Error sending status email for order #${updatedOrder.orderId}:`, emailError.message);
       // Don't fail the status update if email fails
     }
+
+    if (paymentStatusChanged && !Object.prototype.hasOwnProperty.call(update, 'orderStatus')) {
+      const { sendAdminOrderNotification } = require('../utils/emailService');
+      const user = await User.findById(updatedOrder.userId).lean();
+      const adminEmailResult = await sendAdminOrderNotification(updatedOrder, user, 'payment_status_updated');
+      if (!adminEmailResult.success) console.warn(`Admin payment status email was not sent for #${updatedOrder.orderId}: ${adminEmailResult.message}`);
+    }
     
     return res.json(updatedOrder);
   } catch (err) {
@@ -770,7 +1303,7 @@ module.exports.updateOrderStatus = async (req, res) => {
       await session.abortTransaction();
     }
     console.error('Update Order Status Error:', err);
-    return res.status(500).json({ message: 'Server error' });
+    return res.status(err.statusCode || 500).json({ message: err.statusCode ? err.message : 'Server error' });
   } finally {
     session.endSession();
   }
@@ -794,6 +1327,11 @@ module.exports.cancelOrder = async (req, res) => {
       return res.status(404).json({ message: 'Order not found' });
     }
 
+    if (!ownsOrder(order, req.user?._id)) {
+      await session.abortTransaction();
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
     if (!['pending', 'processing'].includes(order.orderStatus)) {
       await session.abortTransaction();
       return res.status(400).json({
@@ -812,6 +1350,8 @@ module.exports.cancelOrder = async (req, res) => {
 
     order.orderStatus = 'cancelled';
     order.isActive = false;
+    await reverseOrderLoyalty(order, session);
+    await releaseDigitalCodesForOrder(order, session);
 
     const updatedOrder = await order.save({ session });
     await session.commitTransaction();
@@ -892,6 +1432,8 @@ module.exports.cancelOrderAdmin = async (req, res) => {
 
     order.orderStatus = 'cancelled';
     order.isActive = false;
+    await reverseOrderLoyalty(order, session);
+    await releaseDigitalCodesForOrder(order, session);
 
     const updatedOrder = await order.save({ session });
     await session.commitTransaction();
@@ -954,13 +1496,23 @@ module.exports.deleteOrder = async (req, res) => {
     }
 
     // 🔹 Release inventory items before deleting order
+    let restoredInventoryItems = [];
     if (orderToDelete.items && orderToDelete.items.length > 0) {
-      const inventoryRelease = await releaseInventoryFromOrder(orderToDelete.items, 'order_deleted');
+      const inventoryRelease = await releaseInventoryFromOrder(orderToDelete.items, 'order_deleted', session);
       if (!inventoryRelease.success) {
         console.error('Failed to release inventory on order deletion:', inventoryRelease.errors);
-        // Continue with deletion even if inventory release fails
+        await session.abortTransaction();
+        return res.status(409).json({
+          success: false,
+          message: 'Order was not deleted because assigned inventory could not be restored.',
+          errors: inventoryRelease.errors,
+        });
       }
+      restoredInventoryItems = inventoryRelease.releasedItems || [];
     }
+
+    await reverseOrderLoyalty(orderToDelete, session);
+    await releaseDigitalCodesForOrder(orderToDelete, session);
 
     const deletedOrder = await Order.findByIdAndDelete(orderId).session(session);
     if (!deletedOrder) {
@@ -969,6 +1521,22 @@ module.exports.deleteOrder = async (req, res) => {
     }
 
     await session.commitTransaction();
+
+    const restoredProductIds = [...new Set(restoredInventoryItems.map((item) => String(item.productId)).filter(Boolean))];
+    if (restoredProductIds.length) {
+      require('./CartController').revalidateCarts({ productIds: restoredProductIds }).catch(() => {});
+      if (ioInstance) {
+        for (const item of restoredInventoryItems) {
+          ioInstance.to('adminRoom').emit('stockUpdate', {
+            productId: item.productId,
+            variantId: item.variantId,
+            size: item.size,
+            action: 'increase',
+            reason: 'order_deleted',
+          });
+        }
+      }
+    }
 
     // Notify via Socket.IO
     notifyOrderUpdate({ 
@@ -1036,6 +1604,9 @@ module.exports.refundOrder = async (req, res) => {
     order.paymentStatus = 'refunded';
     order.orderStatus = 'cancelled';
     order.isActive = false;
+    order.refundAmount = Number(order.grandTotal || order.totalAmount || 0);
+    await reverseOrderLoyalty(order, session);
+    await releaseDigitalCodesForOrder(order, session);
 
     // Sync pending refund request (admin refunded directly while a request was open)
     if (order.refundStatus === 'pending') {
@@ -1177,9 +1748,12 @@ module.exports.processRefundRequest = async (req, res) => {
     if (order.paymentStatus === 'completed') {
       order.paymentStatus = 'refunded';
     }
+    order.refundAmount = Number(order.grandTotal || order.totalAmount || 0);
     order.refundStatus = 'approved';
     order.orderStatus = 'cancelled';
     order.isActive = false;
+    await reverseOrderLoyalty(order);
+    await releaseDigitalCodesForOrder(order);
 
     const updatedOrder = await order.save();
     notifyOrderUpdate(updatedOrder, 'update');
@@ -1229,6 +1803,20 @@ module.exports.adminUpdateOrder = async (req, res) => {
         }
       }
 
+      const hydratedItems = await hydrateFinanceItemSnapshots(payload.items.map((item) => ({
+        ...item,
+        configuration: {
+          ...(item.configuration || {}),
+          regionId: item.regionId || item.configuration?.regionId || null,
+          regionName: item.regionName || item.configuration?.regionName || '',
+          color: item.color || item.configuration?.color || '',
+          hexCode: item.hexCode || item.configuration?.hexCode || '',
+          size: item.size || item.configuration?.size || '',
+          measureType: item.measureType || item.configuration?.measureType || '',
+          unitName: item.unitName || item.configuration?.unitName || '',
+        },
+      })), session);
+
       // 🔹 Release inventory from removed items
       if (order.items && order.items.length > 0) {
         // Find items that are being removed (items that exist in current order but not in new payload)
@@ -1253,19 +1841,43 @@ module.exports.adminUpdateOrder = async (req, res) => {
       }
 
       // 🔹 Update order items without automatic inventory assignment
-      order.items = payload.items.map((item) => {
+      await releaseDigitalCodesForOrder(order, session);
+      order.items = payload.items.map((item, index) => {
+        const snapshot = hydratedItems[index] || item;
         return {
           variantId: item.variantId,
           productId: item.productId,
+          regionId: item.regionId || null,
+          regionName: item.regionName || '',
           discountApplied: Number(item.discountApplied || 0),
           name: item.name,
           quantity: Number(item.quantity || 1),
           price: Number(item.price || 0),
           mainImage: item.mainImage,
+          variantImage: snapshot.variantImage || item.variantImage || item.mainImage || '',
+          sku: snapshot.sku || item.sku || '',
+          brand: snapshot.brand || item.brand || '',
+          categories: snapshot.categories || item.categories || [],
+          productSlug: snapshot.productSlug || item.productSlug || '',
+          variantName: snapshot.variantName || item.variantName || '',
+          hexCode: snapshot.hexCode || item.hexCode || '',
+          costPrice: snapshot.costPrice ?? item.costPrice ?? null,
+          originalPrice: item.originalPrice ?? item.price,
+          discountPrice: item.discountPrice ?? null,
+          barcode: item.barcode || '',
           size: item.size,
           color: item.color,
           measureType: item.measureType,
           unitName: item.unitName,
+          configuration: {
+            regionId: item.regionId || null,
+            regionName: item.regionName || '',
+            color: item.color || '',
+            hexCode: item.hexCode || '',
+            size: item.size || '',
+            measureType: item.measureType || '',
+            unitName: item.unitName || '',
+          },
           assignedInventoryItems: [],
           inventoryAssigned: false
         };
@@ -1364,8 +1976,26 @@ module.exports.adminUpdateOrder = async (req, res) => {
     order.totalAmount = subtotal; // totalAmount represents subtotal
     order.grandTotal = computedGrandTotal; // grandTotal = subtotal - discount + shipping
 
+    if (order.paymentStatus === 'completed') {
+      order.loyaltyRewardEarned = await earnOrderReward(order, session);
+    }
+    if (['failed', 'refunded'].includes(order.paymentStatus) || order.orderStatus === 'cancelled') {
+      await reverseOrderLoyalty(order, session);
+      await releaseDigitalCodesForOrder(order, session);
+    }
+
     const updatedOrder = await order.save({ session });
     await session.commitTransaction();
+
+    if (updatedOrder.paymentStatus === 'completed' && updatedOrder.items.some((item) => item.isDigitalProduct)) {
+      try {
+        const user = await User.findById(updatedOrder.userId).lean();
+        const digitalResult = await sendOrderDigitalCodes(updatedOrder, user);
+        if (!digitalResult.success) console.error(`Digital fulfillment email was not sent for order #${updatedOrder.orderId}: ${digitalResult.message}`);
+      } catch (digitalError) {
+        console.error(`Digital fulfillment email failed for order #${updatedOrder.orderId}:`, digitalError.message);
+      }
+    }
 
     // Notify via Socket.IO
     notifyOrderUpdate(updatedOrder, 'update');
@@ -1453,6 +2083,15 @@ module.exports.assignInventoryToOrderItem = async (req, res) => {
       });
     }
 
+    const expectedRegionId = orderItem.regionId || orderItem.configuration?.regionId;
+    if (expectedRegionId && inventoryItem.regionId && String(expectedRegionId) !== String(inventoryItem.regionId)) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: 'Inventory item region does not match the order item',
+      });
+    }
+
     // Check if we already have enough inventory assigned for this item
     const currentAssignedCount = orderItem.assignedInventoryItems?.length || 0;
     if (currentAssignedCount >= orderItem.quantity) {
@@ -1474,22 +2113,30 @@ module.exports.assignInventoryToOrderItem = async (req, res) => {
     if (product) {
       const variant = product.variants.id(orderItem.variantId);
       if (variant) {
-        const sizeIndex = variant.sizes.indexOf(orderItem.size);
-        if (sizeIndex !== -1) {
+        const configuration = orderItem.configuration || {};
+        const same = (left, right) => String(left || '').trim().toLowerCase() === String(right || '').trim().toLowerCase();
+        const option = variant.options?.find(candidate =>
+          same(candidate.size, configuration.size || orderItem.size) &&
+          same(candidate.measureType, configuration.measureType || orderItem.measureType) &&
+          same(candidate.unitName, configuration.unitName || orderItem.unitName)
+        );
+        const sizeIndex = (variant.sizes || []).findIndex(size => same(size, configuration.size || orderItem.size));
+        if (option || sizeIndex !== -1) {
           // Initialize stockBySize array if it doesn't exist
-          if (!variant.stockBySize) {
+          if (!variant.stockBySize || variant.stockBySize.length !== variant.sizes.length) {
             variant.stockBySize = new Array(variant.sizes.length).fill(0);
           }
           
           // Decrease stock for the specific size
-          if (variant.stockBySize[sizeIndex] > 0) {
+          if (sizeIndex !== -1 && variant.stockBySize[sizeIndex] > 0) {
             variant.stockBySize[sizeIndex] -= 1;
           }
+          if (option && Number(option.stock) > 0) option.stock -= 1;
           
           // Also update legacy stock field for backward compatibility
-          if (variant.stock > 0) {
-            variant.stock -= 1;
-          }
+          variant.stock = variant.options?.length
+            ? variant.options.reduce((sum, entry) => sum + Number(entry.stock || 0), 0)
+            : (variant.stockBySize || []).reduce((sum, count) => sum + Number(count || 0), 0);
           
           await product.save({ session });
           
@@ -1498,8 +2145,8 @@ module.exports.assignInventoryToOrderItem = async (req, res) => {
             ioInstance.to('adminRoom').emit('stockUpdate', {
               productId: product._id,
               variantId: variant._id,
-              size: orderItem.size,
-              newStock: variant.stockBySize[sizeIndex],
+              size: configuration.size || orderItem.size,
+              newStock: option?.stock ?? variant.stockBySize[sizeIndex],
               action: 'decrease'
             });
           }
@@ -1525,6 +2172,23 @@ module.exports.assignInventoryToOrderItem = async (req, res) => {
       orderItem.assignedInventoryItems = [];
     }
     orderItem.assignedInventoryItems.push(inventoryItem._id);
+    if (!orderItem.assignedInventorySnapshots) orderItem.assignedInventorySnapshots = [];
+    orderItem.assignedInventorySnapshots.push({
+      inventoryId: inventoryItem._id,
+      costPrice: inventoryItem.costPrice ?? null,
+      barcode: inventoryItem.barcode || '',
+      realBarcode: inventoryItem.realBarcode || '',
+      qrCode: inventoryItem.qrCode || '',
+      regionId: inventoryItem.regionId || null,
+      regionName: inventoryItem.regionName || '',
+      color: inventoryItem.color?.name || '',
+      size: inventoryItem.size || '',
+      imageUri: inventoryItem.imageUri || '',
+    });
+    const assignedCostSnapshots = orderItem.assignedInventorySnapshots;
+    if (assignedCostSnapshots.length >= Number(orderItem.quantity) && assignedCostSnapshots.every((snapshot) => snapshot.costPrice !== null && snapshot.costPrice !== undefined && Number.isFinite(Number(snapshot.costPrice)))) {
+      orderItem.costPrice = assignedCostSnapshots.reduce((sum, snapshot) => sum + Number(snapshot.costPrice), 0) / assignedCostSnapshots.length;
+    }
     orderItem.inventoryAssigned = orderItem.assignedInventoryItems.length > 0;
 
     // Save the order
@@ -1533,6 +2197,7 @@ module.exports.assignInventoryToOrderItem = async (req, res) => {
       // If we reach here, the operation was successful
       await session.commitTransaction();
       session.endSession();
+      if (product) require('./CartController').revalidateCarts({ productIds: [product._id] }).catch(() => {});
       
       // Notify via Socket.IO
       try {
@@ -1569,6 +2234,7 @@ module.exports.assignInventoryToOrderItem = async (req, res) => {
         _id: inventoryItem._id,
         qrCode: inventoryItem.qrCode,
         barcode: inventoryItem.barcode,
+        realBarcode: inventoryItem.realBarcode || '',
         status: inventoryItem.status,
         size: inventoryItem.size,
         productId: inventoryItem.productId,
@@ -1693,18 +2359,28 @@ module.exports.removeInventoryFromOrderItem = async (req, res) => {
     if (product) {
       const variant = product.variants.id(orderItem.variantId);
       if (variant) {
-        const sizeIndex = variant.sizes.indexOf(orderItem.size);
-        if (sizeIndex !== -1) {
+        const configuration = orderItem.configuration || {};
+        const same = (left, right) => String(left || '').trim().toLowerCase() === String(right || '').trim().toLowerCase();
+        const option = variant.options?.find(candidate =>
+          same(candidate.size, configuration.size || orderItem.size) &&
+          same(candidate.measureType, configuration.measureType || orderItem.measureType) &&
+          same(candidate.unitName, configuration.unitName || orderItem.unitName)
+        );
+        const sizeIndex = (variant.sizes || []).findIndex(size => same(size, configuration.size || orderItem.size));
+        if (option || sizeIndex !== -1) {
           // Initialize stockBySize array if it doesn't exist
-          if (!variant.stockBySize) {
+          if (!variant.stockBySize || variant.stockBySize.length !== variant.sizes.length) {
             variant.stockBySize = new Array(variant.sizes.length).fill(0);
           }
           
           // Increase stock for the specific size
-          variant.stockBySize[sizeIndex] += 1;
+          if (sizeIndex !== -1) variant.stockBySize[sizeIndex] += 1;
+          if (option) option.stock = Number(option.stock || 0) + 1;
           
           // Also update legacy stock field for backward compatibility
-          variant.stock += 1;
+          variant.stock = variant.options?.length
+            ? variant.options.reduce((sum, entry) => sum + Number(entry.stock || 0), 0)
+            : (variant.stockBySize || []).reduce((sum, count) => sum + Number(count || 0), 0);
           
           await product.save({ session });
           
@@ -1713,8 +2389,8 @@ module.exports.removeInventoryFromOrderItem = async (req, res) => {
             ioInstance.to('adminRoom').emit('stockUpdate', {
               productId: product._id,
               variantId: variant._id,
-              size: orderItem.size,
-              newStock: variant.stockBySize[sizeIndex],
+              size: configuration.size || orderItem.size,
+              newStock: option?.stock ?? variant.stockBySize[sizeIndex],
               action: 'increase'
             });
           }
@@ -1741,6 +2417,10 @@ module.exports.removeInventoryFromOrderItem = async (req, res) => {
       const inventoryIdStr = inventoryId.toString ? inventoryId.toString() : String(inventoryId);
       return idStr !== inventoryIdStr;
     });
+    orderItem.assignedInventorySnapshots = (orderItem.assignedInventorySnapshots || []).filter((snapshot) => String(snapshot.inventoryId) !== String(inventoryId));
+    if (orderItem.assignedInventorySnapshots.length > 0 && orderItem.assignedInventorySnapshots.every((snapshot) => snapshot.costPrice !== null && snapshot.costPrice !== undefined && Number.isFinite(Number(snapshot.costPrice)))) {
+      orderItem.costPrice = orderItem.assignedInventorySnapshots.reduce((sum, snapshot) => sum + Number(snapshot.costPrice), 0) / orderItem.assignedInventorySnapshots.length;
+    }
     orderItem.inventoryAssigned = orderItem.assignedInventoryItems.length > 0;
 
     // Save the order
@@ -1749,6 +2429,7 @@ module.exports.removeInventoryFromOrderItem = async (req, res) => {
       // If we reach here, the operation was successful
       await session.commitTransaction();
       session.endSession();
+      if (product) require('./CartController').revalidateCarts({ productIds: [product._id] }).catch(() => {});
       
       // Notify via Socket.IO
       try {
@@ -1878,5 +2559,181 @@ module.exports.sendOrderFinalizationEmail = async (req, res) => {
       message: 'Internal server error',
       error: error.message
     });
+  }
+};
+
+const invoiceSettingsFrom = (source = {}) => ({
+  showLogo: source.showLogo !== 'false' && source.showLogo !== false,
+  includeSignature: source.includeSignature !== 'false' && source.includeSignature !== false,
+  includeQRCode: source.includeQRCode !== 'false' && source.includeQRCode !== false,
+  includeBarcode: source.includeBarcode !== 'false' && source.includeBarcode !== false,
+});
+
+const findInvoiceOrder = async (key) => {
+  const query = mongoose.isValidObjectId(key)
+    ? { $or: [{ _id: key }, { orderId: String(key) }] }
+    : { orderId: String(key) };
+  const order = await Order.findOne(query)
+    .populate('userId', 'email firstName lastName fullName')
+    .populate('items.regionId', 'name')
+    .populate({
+      path: 'items.assignedInventoryItems',
+      select: 'barcode realBarcode qrCode imageUri size color regionId regionName variantId productId',
+      populate: [
+        { path: 'regionId', select: 'name' },
+        { path: 'productId', select: 'name mainImage' },
+      ],
+    });
+  if (!order) return null;
+
+  const orderData = order.toObject();
+  const productIds = orderData.items.map((item) => item.productId?._id || item.productId).filter(mongoose.isValidObjectId);
+  const variantIds = orderData.items.map((item) => item.variantId?._id || item.variantId).filter(mongoose.isValidObjectId);
+  const catalogMatch = [];
+  if (productIds.length) catalogMatch.push({ _id: { $in: productIds } });
+  if (variantIds.length) catalogMatch.push({ 'variants._id': { $in: variantIds } });
+  const catalogProducts = catalogMatch.length
+    ? await Product.find({ $or: catalogMatch })
+      .select('name sku mainImage measureType unitName variants')
+      .populate('regionId', 'name')
+      .populate('regions', 'name')
+      .populate('variants.regionId', 'name')
+      .lean()
+    : [];
+  const byProductId = new Map(catalogProducts.map((product) => [String(product._id), product]));
+  const byVariantId = new Map();
+  catalogProducts.forEach((product) => (product.variants || []).forEach((variant) => byVariantId.set(String(variant._id), product)));
+
+  orderData.items = orderData.items.map((item) => {
+    const productId = item.productId?._id || item.productId;
+    const variantId = item.variantId?._id || item.variantId;
+    const product = (item.productId && typeof item.productId === 'object' && item.productId.name ? item.productId : null)
+      || byProductId.get(String(productId))
+      || byVariantId.get(String(variantId));
+    return { ...item, productId: product || item.productId };
+  });
+  return orderData;
+};
+
+module.exports.getOrderInvoicePdf = async (req, res) => {
+  try {
+    const order = await findInvoiceOrder(req.params.orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    const pdf = await createOrderInvoicePdf(order, invoiceSettingsFrom(req.query));
+    const safeOrderId = String(order.orderId).replace(/[^a-zA-Z0-9_-]/g, '');
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Length': String(pdf.length),
+      'Content-Disposition': `inline; filename="BELORELLA_Order_${safeOrderId}.pdf"`,
+      'Cache-Control': 'private, no-store',
+    });
+    return res.send(pdf);
+  } catch (error) {
+    console.error('Error generating order invoice PDF:', error);
+    return res.status(500).json({ success: false, message: 'Failed to generate invoice PDF' });
+  }
+};
+
+module.exports.emailOrderInvoicePdf = async (req, res) => {
+  try {
+    const order = await findInvoiceOrder(req.params.orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (!order.userId?.email) return res.status(400).json({ success: false, message: 'Customer email is not available for this order' });
+
+    const pdf = await createOrderInvoicePdf(order, invoiceSettingsFrom(req.body));
+    const emailResult = await sendOrderInvoicePdf(order, order.userId, pdf);
+    if (!emailResult.success) {
+      return res.status(502).json({ success: false, message: emailResult.message || 'Failed to send invoice email' });
+    }
+    return res.json({
+      success: true,
+      emailSent: true,
+      email: order.userId.email,
+      message: `Invoice PDF sent to ${order.userId.email}`,
+      messageId: emailResult.messageId,
+    });
+  } catch (error) {
+    console.error('Error emailing order invoice PDF:', error);
+    return res.status(500).json({ success: false, message: 'Failed to email invoice PDF' });
+  }
+};
+
+module.exports.validateCheckout = async (req, res) => {
+  try {
+    const userId = req.user?._id?.toString();
+    if (!userId) return res.status(401).json({ message: 'Login required' });
+
+    const cart = await Cart.findOne({ userId }).populate('couponId');
+    if (!cart || !cart.items.length) {
+      return res.status(200).json({
+        ok: false,
+        blockers: [{ message: 'Your cart is empty. Add items before checkout.' }],
+        items: [], subtotal: 0, discountAmount: 0, orderAmount: 0,
+        baseDelivery: 0, deliveryCharge: 0, extraFees: [], extraFeeTotal: 0, grandTotal: 0,
+        appliedRules: [], notices: [], cart: null,
+      });
+    }
+
+    const { refreshCartFromCatalog, recalcCartWithCoupon } = require('./CartController');
+    await refreshCartFromCatalog(cart);
+    await recalcCartWithCoupon(cart);
+    await cart.save();
+
+    const blockers = cart.items
+      .filter((item) => !item.isAvailable)
+      .map((item) => ({ name: item.name, itemId: item._id, message: item.unavailableReason || 'This cart item is unavailable' }));
+    const shippingName = String(req.body?.shippingName || '').trim();
+    const paymentMethod = String(req.body?.paymentMethod || '').trim();
+    const isDigitalOnlyOrder = cart.items.length > 0 && cart.items.every((item) => Boolean(item.isDigitalProduct));
+    let shippingMethod = null;
+    if (isDigitalOnlyOrder) {
+      if (shippingName === DIGITAL_FREE_SHIPPING_NAME) {
+        shippingMethod = { name: DIGITAL_FREE_SHIPPING_NAME, charge: 0, estimatedDays: 0 };
+      } else {
+        blockers.push({ message: 'Digital-only orders use Free Delivery and do not need a courier method.' });
+      }
+    } else if (shippingName) {
+      const Shipping = require('../models/Shipping');
+      shippingMethod = await Shipping.findOne({ name: shippingName, isActive: true }).lean();
+      if (!shippingMethod) blockers.push({ message: 'Selected shipping method is not available' });
+    } else blockers.push({ message: 'Select a shipping method to continue.' });
+
+    const { evaluateCheckoutRules } = require('../utils/checkoutRuleEngine');
+    const ruleResult = await evaluateCheckoutRules({
+      subtotal: Number(cart.totalAmount || 0),
+      discountAmount: Number(cart.discountAmount || 0),
+      shippingCharge: Number(shippingMethod?.charge || 0),
+      shippingMethodName: shippingMethod?.name || shippingName,
+      paymentMethod,
+      items: cart.items.map((item) => ({ name: item.name, quantity: Number(item.quantity) || 0, price: Number(item.price) || 0, isDigitalProduct: Boolean(item.isDigitalProduct) })),
+    });
+    blockers.push(...ruleResult.blockers);
+
+    await cart.populate('items.productId');
+    return res.status(200).json({
+      ...ruleResult,
+      ok: blockers.length === 0,
+      blockers,
+      shippingMethod: shippingMethod ? {
+        name: shippingMethod.name,
+        charge: shippingMethod.charge,
+        estimatedDays: shippingMethod.estimatedDays,
+      } : null,
+      couponCode: cart.couponId?.code || null,
+      items: cart.items.map((item) => ({
+        itemId: item._id,
+        productId: item.productId?._id || item.productId,
+        configuration: { regionId: item.regionId, variantId: item.variantId, size: item.size, color: item.color, measureType: item.measureType, unitName: item.unitName },
+        quantity: item.quantity,
+        price: item.price,
+        originalPrice: item.originalPrice,
+        isAvailable: item.isAvailable,
+        unavailableReason: item.unavailableReason,
+      })),
+      cart,
+    });
+  } catch (error) {
+    console.error('Checkout validation error:', error);
+    return res.status(error.statusCode || 500).json({ message: error.message || 'Unable to validate checkout' });
   }
 };

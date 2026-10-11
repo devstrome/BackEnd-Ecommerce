@@ -2,25 +2,35 @@ const express = require('express');
 const router = express.Router();
 const orderController = require('../controller/OrderController');
 
-const { authenticateAdmin, requireSuperAdmin } = require('../middleware/AdminAuthMiddleware');
+const { authenticateAdmin } = require('../middleware/AdminAuthMiddleware');
 const authenticate = require('../middleware/UserAuthMiddleware');
 const upload = require('../config/multerconfig');
 
 
 
 // 🛒 Create order — authenticated user
+router.post('/checkout/validate', authenticate, orderController.validateCheckout);
 router.post('/order', authenticate, orderController.createOrder);
 
 
 router.get('/orders', authenticate , orderController.getOrders);
+router.get('/admin/orders/:orderId', authenticateAdmin, orderController.getAdminOrderByOrderId);
+router.get('/admin/orders/:orderId/digital-fulfillment', authenticateAdmin, orderController.getAdminDigitalFulfillment);
+router.put('/orders/:orderId/digital-fulfillment', authenticateAdmin, orderController.updateAdminDigitalFulfillment);
+router.post('/orders/:orderId/digital-fulfillment-email', authenticateAdmin, orderController.emailAdminDigitalFulfillment);
 
 router.get('/allorders',authenticateAdmin, orderController.getAllOrders);
+router.patch('/orders/:orderId/mark-opened', authenticateAdmin, orderController.markOrderOpened);
+
+// Admin invoice preview / print and customer email with the generated PDF.
+router.get('/orders/:orderId/invoice-pdf', authenticateAdmin, orderController.getOrderInvoicePdf);
+router.post('/orders/:orderId/invoice-email', authenticateAdmin, orderController.emailOrderInvoicePdf);
 
 // 🛡️ Admin: create an order manually for a customer
 router.post('/admin/orders', authenticateAdmin, orderController.adminCreateOrder);
 
-// 🕵️ Get single order — either
-router.get('/orders/:orderId',   orderController.getOrderByOrderId);
+// Customer order reads are scoped to the authenticated account.
+router.get('/orders/:orderId', authenticate, orderController.getOrderByOrderId);
 
 // 🔄 Update status — admin only
 router.patch('/orders/:orderId/status', authenticateAdmin, orderController.updateOrderStatus);
@@ -47,7 +57,7 @@ router.post('/upload/refund-image', authenticate, upload.single('image'), (req, 
 });
 
 // 🗑️ Delete — only super admin
-router.delete('/orders/:orderId', [authenticateAdmin, requireSuperAdmin], orderController.deleteOrder);
+router.delete('/orders/:orderId', authenticateAdmin, orderController.deleteOrder);
 
 // ✏️ Admin edit order (full update)
 router.put('/orders/:orderId', authenticateAdmin, orderController.adminUpdateOrder);

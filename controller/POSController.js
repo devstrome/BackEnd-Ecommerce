@@ -1,10 +1,206 @@
 const POSOrder = require('../models/POSOrder');
+const User = require('../models/User');
+const LoyaltyAccount = require('../models/LoyaltyAccount');
+const LoyaltyGiftCode = require('../models/LoyaltyGiftCode');
+const mongoose = require('mongoose');
 const Inventory = require('../models/Inventory');
 const Product = require('../models/Product');
 const catchAsyncErrors = require('../middleware/catchAsyncErrors');
 const ErrorHandler = require('../utils/errorHandler');
 const { sendPOSReceipt } = require('../utils/emailService');
 const { enrichInventoryItem } = require('./InventoryController');
+const { createOrderInvoicePdf } = require('../utils/orderInvoicePdf');
+const escapeRegex = require('../utils/escapeRegex');
+const {
+  getLoyaltyAccount,
+  getLoyaltySettings,
+  changeLoyaltyBalance,
+  calculateOrderReward,
+  hashCode,
+} = require('../utils/loyaltyService');
+
+const reversePOSOrderLoyalty = async (posOrder, session = null) => {
+  if (!posOrder?.loyaltyUserId) return;
+  if (Number(posOrder.loyaltyAmountUsed || 0) > 0) {
+    await changeLoyaltyBalance({
+      userId: posOrder.loyaltyUserId,
+      amountBDT: posOrder.loyaltyAmountUsed,
+      direction: 'credit',
+      source: 'pos_refund',
+      referenceId: posOrder.orderNumber,
+      note: `Restored loyalty balance for deleted, cancelled, or refunded POS order #${posOrder.orderNumber}`,
+      idempotencyKey: `pos:${posOrder._id}:loyalty-restore`,
+      session,
+    });
+  }
+  if (Number(posOrder.loyaltyRewardEarned || 0) > 0) {
+    await changeLoyaltyBalance({
+      userId: posOrder.loyaltyUserId,
+      amountBDT: posOrder.loyaltyRewardEarned,
+      direction: 'debit',
+      source: 'pos_refund',
+      referenceId: posOrder.orderNumber,
+      note: `Reversed loyalty reward for deleted, cancelled, or refunded POS order #${posOrder.orderNumber}`,
+      idempotencyKey: `pos:${posOrder._id}:reward-reversal`,
+      session,
+      allowNegative: true,
+    });
+  }
+  for (const redemption of posOrder.giftCodeRedemptions || []) {
+    if (Number(redemption.balanceCreditedBDT || 0) > 0) {
+      await changeLoyaltyBalance({
+        userId: posOrder.loyaltyUserId,
+        amountBDT: redemption.balanceCreditedBDT,
+        direction: 'debit',
+        source: 'pos_refund',
+        referenceId: posOrder.orderNumber,
+        note: `Reversed unused POS voucher balance ••••-${redemption.codeSuffix}`,
+        idempotencyKey: `pos:${posOrder._id}:gift-remainder-reversal:${redemption.giftCodeId}`,
+        session,
+        allowNegative: true,
+      });
+    }
+    await LoyaltyGiftCode.updateOne(
+      { _id: redemption.giftCodeId, status: 'redeemed', redeemedBy: posOrder.loyaltyUserId, redeemedAt: redemption.redeemedAt },
+      { $set: { status: 'active', redeemedBy: null, redeemedAt: null } },
+      session ? { session } : {},
+    );
+  }
+};
+
+const inventoryVariantPopulate = {
+  path: 'items.inventoryId',
+  select: 'barcode realBarcode qrCode availableQuantity regionId regionName variantId productId imageUri size color price discountPrice',
+  populate: {
+    path: 'productId',
+    select: 'name sku mainImage measureType unitName variants',
+    populate: { path: 'variants.regionId', select: 'name' },
+  },
+};
+
+const imageUrl = (value) => typeof value === 'string'
+  ? value
+  : value?.secure_url || value?.url || value?.src || value?.path || '';
+
+const hydratePOSOrderRegions = (posOrder) => {
+  if (!posOrder) return posOrder;
+  const plainOrder = posOrder?.toObject ? posOrder.toObject() : posOrder;
+  return {
+    ...plainOrder,
+    items: (plainOrder.items || []).map((plainItem) => {
+      const inventory = plainItem.inventoryId;
+      const enrichedInventory = inventory?.productId?.variants
+        ? enrichInventoryItem(inventory)
+        : inventory;
+      return {
+        ...plainItem,
+        variantInfo: {
+          ...(plainItem.variantInfo || {}),
+          size: plainItem.variantInfo?.size || enrichedInventory?.size || '',
+          color: plainItem.variantInfo?.color || enrichedInventory?.color?.name || enrichedInventory?.colorName || '',
+          measureType: plainItem.variantInfo?.measureType || enrichedInventory?.variantId?.measureType || '',
+          unitName: plainItem.variantInfo?.unitName || enrichedInventory?.variantId?.unitName || '',
+          regionId: plainItem.variantInfo?.regionId || enrichedInventory?.regionId || null,
+          regionName: plainItem.variantInfo?.regionName || enrichedInventory?.regionName || '',
+          imageUrl: plainItem.variantInfo?.imageUrl || imageUrl(enrichedInventory?.variantImage) || imageUrl(enrichedInventory?.imageUri) || imageUrl(enrichedInventory?.productId?.mainImage),
+          sku: plainItem.variantInfo?.sku || enrichedInventory?.productId?.sku || '',
+          barcode: plainItem.variantInfo?.barcode || enrichedInventory?.barcode || '',
+          realBarcode: plainItem.variantInfo?.realBarcode || enrichedInventory?.realBarcode || '',
+          qrCode: plainItem.variantInfo?.qrCode || enrichedInventory?.qrCode || '',
+        },
+        productName: plainItem.productName || enrichedInventory?.productId?.name || 'Product',
+      };
+    }),
+  };
+};
+
+const toPOSInvoiceOrder = (source) => {
+  const order = source?.toObject ? source.toObject() : source;
+  const items = (order.items || []).map((item) => {
+    const inventory = item.inventoryId && typeof item.inventoryId === 'object' ? item.inventoryId : null;
+    const directProduct = item.productId && typeof item.productId === 'object' ? item.productId : null;
+    const product = directProduct?.variants?.length ? directProduct : inventory?.productId?.variants?.length ? inventory.productId : directProduct || inventory?.productId;
+    const variantInfo = item.variantInfo || {};
+    const variantId = inventory?.variantId || item.variantId;
+    const variant = product?.variants?.find((entry) => String(entry._id) === String(variantId)) || null;
+    const variantImage = imageUrl(variant?.images?.[0]) || imageUrl(variantInfo.imageUrl) || imageUrl(inventory?.imageUri) || imageUrl(product?.mainImage);
+    const barcode = inventory?.barcode || variantInfo.barcode || item.scannedBarcode || '';
+    const realBarcode = inventory?.realBarcode || variantInfo.realBarcode || '';
+    const qrCode = inventory?.qrCode || variantInfo.qrCode || '';
+    const unitPrice = Number(item.unitPrice) || Number(inventory?.price) || 0;
+    const effectivePrice = Number(item.discountPrice) > 0 ? Number(item.discountPrice) : unitPrice;
+    const quantity = Math.max(1, Number(item.quantity) || 1);
+    return {
+      name: item.productName || product?.name || 'Product',
+      productId: product || item.productId,
+      variantId,
+      sku: variantInfo.sku || product?.sku || '',
+      mainImage: variantImage,
+      variantImage,
+      brand: item.brand || product?.brand || '',
+      quantity,
+      price: effectivePrice,
+      originalPrice: unitPrice,
+      discountApplied: Math.max(0, unitPrice - effectivePrice) * quantity,
+      size: variantInfo.size || inventory?.size || '',
+      color: variantInfo.color || inventory?.color?.name || variant?.colorName || '',
+      variantName: variantInfo.variantName || [variantInfo.color || inventory?.color?.name || variant?.colorName, variantInfo.size || inventory?.size].filter(Boolean).join(' / '),
+      barcode,
+      realBarcode,
+      measureType: variantInfo.measureType || variant?.measureType || product?.measureType || '',
+      unitName: variantInfo.unitName || variant?.unitName || product?.unitName || '',
+      regionId: variantInfo.regionId || inventory?.regionId || variant?.regionId?._id || variant?.regionId || null,
+      regionName: variantInfo.regionName || inventory?.regionName || variant?.regionId?.name || '',
+      assignedInventoryItems: inventory || barcode || qrCode || realBarcode ? [{
+        id: inventory?._id || '',
+        barcode,
+        realBarcode,
+        qrCode,
+        regionId: variantInfo.regionId || inventory?.regionId || null,
+        regionName: variantInfo.regionName || inventory?.regionName || variant?.regionId?.name || '',
+        color: variantInfo.color || inventory?.color?.name || variant?.colorName || '',
+        size: variantInfo.size || inventory?.size || '',
+      }] : [],
+    };
+  });
+  return {
+    orderId: order.orderNumber,
+    createdAt: order.createdAt,
+    orderStatus: order.orderStatus,
+    paymentStatus: order.paymentStatus,
+    paymentMethod: order.paymentMethod,
+    shippingAddress: {
+      fullName: order.customer?.name || 'Walk-in Customer',
+      phone: order.customer?.phone || '',
+      address: order.customer?.address || 'In-store purchase',
+      city: '', state: '', postalCode: '', country: 'Bangladesh',
+    },
+    shipping: { name: 'Point of Sale', charge: 0 },
+    shippingCost: 0,
+    totalAmount: Number(order.subtotal) || items.reduce((sum, item) => sum + item.price * item.quantity, 0),
+    discountAmount: Number(order.discount) || 0,
+    tax: Number(order.tax) || 0,
+    grandTotal: Number(order.total) || 0,
+    amountDue: (Number(order.loyaltyAmountUsed) > 0 || Number(order.giftCodeAmountUsed) > 0) && Number.isFinite(Number(order.amountDue))
+      ? Number(order.amountDue)
+      : Math.max(0, (Number(order.total) || 0) - (Number(order.loyaltyAmountUsed) || 0) - (Number(order.giftCodeAmountUsed) || 0)),
+    loyaltyAmountUsed: Number(order.loyaltyAmountUsed) || 0,
+    giftCodeAmountUsed: Number(order.giftCodeAmountUsed) || 0,
+    giftCodeRedemptions: (order.giftCodeRedemptions || []).map((entry) => ({
+      codeSuffix: entry.codeSuffix,
+      faceValueBDT: entry.faceValueBDT,
+      appliedBDT: entry.appliedBDT,
+    })),
+    loyaltyRewardEarned: Number(order.loyaltyRewardEarned) || 0,
+    items,
+  };
+};
+
+const sendPOSReceiptWithPdf = async (posOrder) => {
+  const hydrated = hydratePOSOrderRegions(posOrder);
+  const pdf = await createOrderInvoicePdf(toPOSInvoiceOrder(hydrated));
+  return sendPOSReceipt(hydrated, pdf);
+};
 
 // Generate unique POS order number
 async function generatePOSOrderNumber() {
@@ -42,7 +238,10 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
     total,
     paymentMethod,
     outlet,
-    notes
+    notes,
+    loyaltyUserId,
+    loyaltyAmountBDT = 0,
+    loyaltyGiftCode = '',
   } = req.body;
 
   // Validate items and check inventory
@@ -70,59 +269,204 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
       return next(new ErrorHandler(`Insufficient stock for ${inventory.barcode}`, 400));
     }
 
+    if (item.productId && String(item.productId) !== String(inventory.productId)) {
+      return next(new ErrorHandler(`Inventory product does not match ${inventory.barcode}`, 400));
+    }
+
+    const product = await Product.findById(inventory.productId)
+      .select('name slug sku brand categories costPrice mainImage measureType unitName variants')
+      .populate('variants.regionId', 'name');
+    const variant = product?.variants?.id(inventory.variantId)
+      || product?.variants?.find((entry) => String(entry._id) === String(inventory.variantId));
+    const unitPrice = Math.max(0, Number(inventory.price) || 0);
+    const rawDiscountPrice = Number(inventory.discountPrice);
+    const discountPrice = rawDiscountPrice > 0 && rawDiscountPrice < unitPrice ? rawDiscountPrice : null;
+    const effectivePrice = discountPrice || unitPrice;
+    const variantImage = imageUrl(variant?.images?.[0]) || imageUrl(inventory.imageUri) || imageUrl(product?.mainImage);
+    const regionId = inventory.regionId || variant?.regionId?._id || variant?.regionId || null;
+    const regionName = inventory.regionName || variant?.regionId?.name || '';
+    const colorName = inventory.color?.name || variant?.colorName || '';
+    const size = inventory.size || item.variantInfo?.size || item.size || '';
+    const option = (variant?.options || []).find((entry) => String(entry.size || '').trim().toLowerCase() === String(size).trim().toLowerCase());
+    const rawCostPrice = inventory.costPrice ?? option?.costPrice ?? variant?.costPrice ?? product?.costPrice;
+    const costPrice = rawCostPrice !== null && rawCostPrice !== undefined && Number.isFinite(Number(rawCostPrice)) ? Number(rawCostPrice) : null;
+
     normalizedItems.push({
       inventoryId: item.inventoryId,
-      productId: item.productId,
-      productName: item.productName,
+      productId: inventory.productId,
+      productSlug: product?.slug || '',
+      brand: product?.brand || '',
+      categories: product?.categories || [],
+      productName: product?.name || item.productName || 'Product',
+      sku: product?.sku || '',
       variantInfo: {
-        size: item.variantInfo?.size ?? item.size,
-        color: item.variantInfo?.color ?? item.color,
-        barcode: item.variantInfo?.barcode ?? item.barcode,
-        measureType: item.measureType ?? item.variantInfo?.measureType,
-        unitName: item.unitName ?? item.variantInfo?.unitName
+        size,
+        color: colorName || item.variantInfo?.color || item.color,
+        barcode: inventory.barcode,
+        realBarcode: inventory.realBarcode || item.variantInfo?.realBarcode || '',
+        qrCode: inventory.qrCode || item.variantInfo?.qrCode || '',
+        variantId: variant?._id || null,
+        variantName: [colorName, size].filter(Boolean).join(' / '),
+        hexCode: inventory.color?.hexCode || variant?.hexCode || '',
+        measureType: variant?.measureType || product?.measureType || item.measureType || item.variantInfo?.measureType || '',
+        unitName: variant?.unitName || product?.unitName || item.unitName || item.variantInfo?.unitName || '',
+        regionId,
+        regionName,
+        imageUrl: variantImage,
+        sku: product?.sku || '',
       },
       quantity: qty,
-      unitPrice: item.unitPrice,
-      discountPrice: item.discountPrice,
-      totalPrice: item.totalPrice,
-      scannedBarcode: item.scannedBarcode
+      unitPrice,
+      discountPrice,
+      costPrice,
+      totalPrice: effectivePrice * qty,
+      scannedBarcode: inventory.barcode || item.scannedBarcode || '',
     });
   }
 
+  const orderSubtotal = normalizedItems.reduce((sum, item) => sum + item.totalPrice, 0);
+  const orderTax = Math.max(0, Number.isFinite(Number(tax)) ? Number(tax) : 0);
+  const orderDiscount = Math.max(0, Number.isFinite(Number(discount)) ? Number(discount) : 0);
+  const orderTotal = Math.max(0, orderSubtotal + orderTax - orderDiscount);
+
+  const requestedLoyalty = Number(loyaltyAmountBDT || 0);
+  if (!Number.isFinite(requestedLoyalty) || requestedLoyalty < 0) {
+    return next(new ErrorHandler('Enter a valid BDT loyalty amount', 400));
+  }
+  if (requestedLoyalty > 0 && !mongoose.isValidObjectId(loyaltyUserId)) {
+    return next(new ErrorHandler('Look up and select a loyalty customer before applying BDT', 400));
+  }
+  const normalizedGiftCode = String(loyaltyGiftCode || '').trim().toUpperCase();
+  if (normalizedGiftCode && !mongoose.isValidObjectId(loyaltyUserId)) {
+    return next(new ErrorHandler('Look up and select a loyalty customer before redeeming a gift code', 400));
+  }
+  if (normalizedGiftCode.length > 100) return next(new ErrorHandler('Gift code is invalid', 400));
+
   // Generate unique order number
   const orderNumber = await generatePOSOrderNumber();
+  const session = await mongoose.startSession();
+  let posOrder;
+  try {
+    session.startTransaction();
+    const member = loyaltyUserId ? await User.findById(loyaltyUserId).session(session) : null;
+    if (loyaltyUserId && !member) throw new ErrorHandler('Loyalty customer was not found', 404);
+    const settings = await getLoyaltySettings(session);
+    const account = member ? await getLoyaltyAccount(member._id, session) : null;
+    const redeemLimit = settings.enabled ? orderTotal * Number(settings.maxRedeemPercent || 0) / 100 : 0;
+    const loyaltyUsed = Math.round(Math.min(requestedLoyalty, Number(account?.balanceBDT || 0), redeemLimit, orderTotal) * 100) / 100;
+    let giftCodeRecord = null;
+    let giftCodeApplied = 0;
+    let giftCodeBalanceCredited = 0;
+    let giftCodeRedeemedAt = null;
+    if (normalizedGiftCode) {
+      const now = new Date();
+      giftCodeRecord = await LoyaltyGiftCode.findOneAndUpdate(
+        { codeHash: hashCode(normalizedGiftCode), status: 'active', $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }] },
+        { $set: { status: 'redeemed', redeemedBy: member._id, redeemedAt: now } },
+        { new: true, session },
+      );
+      if (!giftCodeRecord) throw new ErrorHandler('Gift code is invalid, expired, or already redeemed', 400);
+      giftCodeRedeemedAt = now;
+      giftCodeApplied = Math.round(Math.min(Number(giftCodeRecord.amountBDT) || 0, Math.max(0, orderTotal - loyaltyUsed)) * 100) / 100;
+      giftCodeBalanceCredited = Math.round(Math.max(0, Number(giftCodeRecord.amountBDT) - giftCodeApplied) * 100) / 100;
+    }
+    const rewardEarned = member ? await calculateOrderReward({ userId: member._id, totalAmount: orderSubtotal, discountAmount: orderDiscount }, session) : 0;
 
-  const posOrder = await POSOrder.create({
-    orderNumber,
-    customer,
-    items: normalizedItems,
-    subtotal,
-    tax,
-    discount,
-    total,
-    paymentMethod,
-    paymentStatus: 'completed', // Auto-confirm payment
-    orderStatus: 'completed', // Auto-confirm order
-    cashier: req.admin.id,
-    outlet,
-    notes
-  });
+    posOrder = new POSOrder({
+      orderNumber,
+      customer: {
+        ...customer,
+        name: customer?.name || member?.fullName || 'Walk-in Customer',
+        email: customer?.email || member?.email || '',
+        phone: customer?.phone || member?.phoneNumber || '',
+      },
+      loyaltyUserId: member?._id || null,
+      loyaltyAmountUsed: loyaltyUsed,
+      giftCodeAmountUsed: giftCodeApplied,
+      giftCodeRedemptions: giftCodeRecord ? [{
+        giftCodeId: giftCodeRecord._id,
+        codeSuffix: giftCodeRecord.codeSuffix,
+        faceValueBDT: giftCodeRecord.amountBDT,
+        appliedBDT: giftCodeApplied,
+        balanceCreditedBDT: giftCodeBalanceCredited,
+        redeemedAt: giftCodeRedeemedAt,
+      }] : [],
+      loyaltyRewardEarned: rewardEarned,
+      amountDue: Math.max(0, Math.round((orderTotal - loyaltyUsed - giftCodeApplied) * 100) / 100),
+      items: normalizedItems,
+      subtotal: orderSubtotal,
+      tax: orderTax,
+      discount: orderDiscount,
+      total: orderTotal,
+      paymentMethod,
+      paymentStatus: 'completed',
+      orderStatus: 'completed',
+      cashier: req.admin.id,
+      outlet,
+      notes: [String(notes || '').trim(), giftCodeRecord ? `Gift code redeemed ••••-${giftCodeRecord.codeSuffix} · ${giftCodeApplied.toFixed(2)} BDT applied` : ''].filter(Boolean).join('\n').slice(0, 5000),
+    });
+    await posOrder.save({ session });
 
-  // Update inventory — quantity-aware (pipeline update survives findByIdAndUpdate
-  // bypassing the schema pre-save hook; status mirrors the same rule as the hook)
-  for (const item of normalizedItems) {
-    await Inventory.findByIdAndUpdate(item.inventoryId, [
-      {
-        $set: {
-          assignedQuantity: item.quantity,
-          availableQuantity: { $max: [0, { $subtract: ['$stockQuantity', item.quantity] }] },
-          status: {
-            $cond: [{ $lte: [{ $subtract: ['$stockQuantity', item.quantity] }, 0] }, 'out_of_stock', 'active']
-          },
-          lastUpdated: new Date()
+    if (giftCodeBalanceCredited > 0 && member) {
+      await changeLoyaltyBalance({
+        userId: member._id,
+        amountBDT: giftCodeBalanceCredited,
+        direction: 'credit',
+        source: 'pos_gift_code',
+        referenceId: orderNumber,
+        note: `Unused voucher value ••••-${giftCodeRecord.codeSuffix} credited to loyalty balance`,
+        idempotencyKey: `pos:${orderNumber}:gift-code-remainder:${giftCodeRecord._id}`,
+        createdBy: req.admin.id,
+        session,
+      });
+    }
+
+    if (loyaltyUsed > 0 && member) {
+      await changeLoyaltyBalance({
+        userId: member._id,
+        amountBDT: loyaltyUsed,
+        direction: 'debit',
+        source: 'pos_redemption',
+        referenceId: orderNumber,
+        note: `Loyalty balance used at POS order #${orderNumber}`,
+        idempotencyKey: `pos:${orderNumber}:redeem`,
+        session,
+      });
+    }
+    if (rewardEarned > 0 && member) {
+      await changeLoyaltyBalance({
+        userId: member._id,
+        amountBDT: rewardEarned,
+        direction: 'credit',
+        source: 'pos_reward',
+        referenceId: orderNumber,
+        note: `Loyalty reward for POS order #${orderNumber}`,
+        idempotencyKey: `pos:${orderNumber}:reward`,
+        session,
+      });
+    }
+
+    // Update inventory in the same transaction as loyalty balance and sale.
+    for (const item of normalizedItems) {
+      await Inventory.findByIdAndUpdate(item.inventoryId, [
+        {
+          $set: {
+            assignedQuantity: item.quantity,
+            availableQuantity: { $max: [0, { $subtract: ['$stockQuantity', item.quantity] }] },
+            status: {
+              $cond: [{ $lte: [{ $subtract: ['$stockQuantity', item.quantity] }, 0] }, 'out_of_stock', 'active']
+            },
+            lastUpdated: new Date()
+          }
         }
-      }
-    ]);
+      ], { session });
+    }
+    await session.commitTransaction();
+  } catch (error) {
+    if (session.inTransaction()) await session.abortTransaction();
+    throw error;
+  } finally {
+    await session.endSession();
   }
 
   // Broadcast live purchase via socket
@@ -147,7 +491,7 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
 
   // Send receipt email (non-blocking)
   if (posOrder.customer?.email) {
-    sendPOSReceipt(posOrder).catch(err => {
+    sendPOSReceiptWithPdf(posOrder).catch(err => {
       console.error('Failed to send POS receipt email:', err.message);
     });
   }
@@ -155,6 +499,56 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
   res.status(201).json({
     success: true,
     posOrder
+  });
+});
+
+exports.findLoyaltyCustomer = catchAsyncErrors(async (req, res, next) => {
+  const search = String(req.query.query || '').trim();
+  if (search.length < 3) return next(new ErrorHandler('Enter at least 3 characters of phone or email', 400));
+  const normalizedPhone = search.replace(/[\s()-]/g, '');
+  const user = await User.findOne({
+    $or: [
+      { email: search.toLowerCase() },
+      { phoneNumber: normalizedPhone },
+      { phoneNumber: { $regex: `^${escapeRegex(normalizedPhone)}$`, $options: 'i' } },
+    ],
+  }).select('firstName lastName fullName email phoneNumber');
+  if (!user) return next(new ErrorHandler('No registered customer matched that phone or email', 404));
+  const account = await LoyaltyAccount.findOne({ userId: user._id }).lean();
+  const loyaltySettings = await getLoyaltySettings();
+  return res.json({
+    success: true,
+    customer: {
+      userId: String(user._id),
+      name: user.fullName || `${user.firstName} ${user.lastName}`.trim(),
+      email: user.email,
+      phone: user.phoneNumber || '',
+      balanceBDT: Math.round(Number(account?.balanceBDT || 0) * 100) / 100,
+      tierName: account?.tierName || '',
+      earnRatePercent: account?.earnRatePercent ?? loyaltySettings.earnRatePercent,
+      enabled: loyaltySettings.enabled,
+      maxRedeemPercent: loyaltySettings.maxRedeemPercent,
+    },
+  });
+});
+
+exports.validatePOSGiftCode = catchAsyncErrors(async (req, res, next) => {
+  const code = String(req.body?.code || '').trim().toUpperCase();
+  const userId = String(req.body?.userId || '');
+  if (code.length < 6 || code.length > 100) return next(new ErrorHandler('Enter a valid gift code', 400));
+  if (!mongoose.isValidObjectId(userId) || !await User.exists({ _id: userId })) {
+    return next(new ErrorHandler('Look up and select a loyalty customer before redeeming a gift code', 400));
+  }
+  const now = new Date();
+  const gift = await LoyaltyGiftCode.findOne({
+    codeHash: hashCode(code),
+    status: 'active',
+    $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
+  }).select('amountBDT codeSuffix expiresAt').lean();
+  if (!gift) return next(new ErrorHandler('Gift code is invalid, expired, or already redeemed', 404));
+  return res.json({
+    success: true,
+    giftCode: { amountBDT: gift.amountBDT, codeSuffix: gift.codeSuffix, expiresAt: gift.expiresAt || null },
   });
 });
 
@@ -182,17 +576,18 @@ exports.getAllPOSOrders = catchAsyncErrors(async (req, res, next) => {
 
   const posOrders = await POSOrder.find(query)
     .populate('cashier', 'firstName lastName')
-    .populate('items.inventoryId', 'barcode qrCode availableQuantity')
+    .populate(inventoryVariantPopulate)
     .populate('items.productId', 'name images')
     .sort({ createdAt: -1 })
     .limit(limit * 1)
     .skip((page - 1) * limit);
 
+  const hydratedPOSOrders = posOrders.map(hydratePOSOrderRegions);
   const total = await POSOrder.countDocuments(query);
 
   res.status(200).json({
     success: true,
-    posOrders,
+    posOrders: hydratedPOSOrders,
     totalPages: Math.ceil(total / limit),
     currentPage: page,
     total
@@ -203,7 +598,7 @@ exports.getAllPOSOrders = catchAsyncErrors(async (req, res, next) => {
 exports.getPOSOrder = catchAsyncErrors(async (req, res, next) => {
   const posOrder = await POSOrder.findById(req.params.id)
     .populate('cashier', 'firstName lastName')
-    .populate('items.inventoryId', 'barcode qrCode availableQuantity')
+    .populate(inventoryVariantPopulate)
     .populate('items.productId', 'name images');
 
   if (!posOrder) {
@@ -212,31 +607,38 @@ exports.getPOSOrder = catchAsyncErrors(async (req, res, next) => {
 
   res.status(200).json({
     success: true,
-    posOrder
+    posOrder: hydratePOSOrderRegions(posOrder)
   });
 });
 
 // Update POS order status
 exports.updatePOSOrderStatus = catchAsyncErrors(async (req, res, next) => {
   const { orderStatus, paymentStatus } = req.body;
-
-  const posOrder = await POSOrder.findById(req.params.id);
-  if (!posOrder) {
-    return next(new ErrorHandler('POS Order not found', 404));
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const posOrder = await POSOrder.findById(req.params.id).session(session);
+    if (!posOrder) {
+      await session.abortTransaction();
+      return next(new ErrorHandler('POS Order not found', 404));
+    }
+    posOrder.orderStatus = orderStatus || posOrder.orderStatus;
+    posOrder.paymentStatus = paymentStatus || posOrder.paymentStatus;
+    if (['cancelled', 'refunded'].includes(String(posOrder.orderStatus).toLowerCase()) || posOrder.paymentStatus === 'refunded') {
+      await reversePOSOrderLoyalty(posOrder, session);
+    }
+    await posOrder.save({ session });
+    await session.commitTransaction();
+    return res.status(200).json({ success: true, posOrder });
+  } catch (error) {
+    if (session.inTransaction()) await session.abortTransaction();
+    throw error;
+  } finally {
+    await session.endSession();
   }
-
-  posOrder.orderStatus = orderStatus || posOrder.orderStatus;
-  posOrder.paymentStatus = paymentStatus || posOrder.paymentStatus;
-  
-  await posOrder.save();
-
-  res.status(200).json({
-    success: true,
-    posOrder
-  });
 });
 
-// Scan barcode and get product info (barcode → qrCode → product SKU)
+// Scan generated barcode, manufacturer barcode, QR, or product SKU.
 exports.scanBarcode = catchAsyncErrors(async (req, res, next) => {
   const { barcode } = req.body;
   if (!barcode) {
@@ -245,20 +647,26 @@ exports.scanBarcode = catchAsyncErrors(async (req, res, next) => {
 
   const code = String(barcode).trim();
   const PROJ = 'name mainImage mainPrice variants sku';
-  let inventory = await Inventory.findOne({ barcode: code })
-    .populate('productId', PROJ);
+  const populatePOSProduct = (query) => query.populate({
+    path: 'productId',
+    select: PROJ,
+    populate: { path: 'variants.regionId', select: 'name' },
+  });
+  let inventory = await populatePOSProduct(Inventory.findOne({ barcode: code }));
 
   if (!inventory) {
-    inventory = await Inventory.findOne({ qrCode: code })
-      .populate('productId', PROJ);
+    inventory = await populatePOSProduct(Inventory.findOne({ qrCode: code }));
+  }
+
+  if (!inventory) {
+    inventory = await populatePOSProduct(Inventory.findOne({ realBarcode: code, availableQuantity: { $gt: 0 }, status: 'active' }).sort({ createdAt: 1 }));
   }
 
   if (!inventory) {
     // Product-level SKU: sell first available unit of that product
-    const product = await Product.findOne({ sku: { $regex: `^${code}$`, $options: 'i' } }).select('_id');
+    const product = await Product.findOne({ sku: { $regex: `^${escapeRegex(code)}$`, $options: 'i' } }).select('_id');
     if (product) {
-      inventory = await Inventory.findOne({ productId: product._id, availableQuantity: { $gt: 0 } })
-        .populate('productId', PROJ);
+      inventory = await populatePOSProduct(Inventory.findOne({ productId: product._id, availableQuantity: { $gt: 0 } }));
     }
   }
 
@@ -276,7 +684,7 @@ exports.scanBarcode = catchAsyncErrors(async (req, res, next) => {
   });
 });
 
-// Search products by name, SKU, barcode or qr code
+// Search products by name, SKU, generated or manufacturer barcode, or QR code.
 exports.searchProducts = catchAsyncErrors(async (req, res, next) => {
   const { query } = req.query;
   if (!query) {
@@ -291,11 +699,16 @@ exports.searchProducts = catchAsyncErrors(async (req, res, next) => {
   const inventory = await Inventory.find({
     $or: [
       { barcode: rx },
+      { realBarcode: rx },
       { qrCode: rx },
       ...(products.length ? [{ productId: { $in: products.map(p => p._id) } }] : [])
     ]
   })
-  .populate('productId', 'name mainImage mainPrice variants sku')
+  .populate({
+    path: 'productId',
+    select: 'name mainImage mainPrice variants sku',
+    populate: { path: 'variants.regionId', select: 'name' },
+  })
   .limit(10);
 
   res.status(200).json({
@@ -354,7 +767,7 @@ exports.printReceipt = catchAsyncErrors(async (req, res, next) => {
   const posOrder = await POSOrder.findById(req.params.id)
     .populate('cashier', 'firstName lastName')
     .populate('items.productId', 'name')
-    .populate('items.inventoryId', 'barcode');
+    .populate(inventoryVariantPopulate);
 
   if (!posOrder) {
     return next(new ErrorHandler('POS Order not found', 404));
@@ -365,11 +778,15 @@ exports.printReceipt = catchAsyncErrors(async (req, res, next) => {
     date: posOrder.createdAt,
     cashier: posOrder.cashier,
     customer: posOrder.customer,
-    items: posOrder.items,
+    items: hydratePOSOrderRegions(posOrder).items,
     subtotal: posOrder.subtotal,
     tax: posOrder.tax,
     discount: posOrder.discount,
     total: posOrder.total,
+    loyaltyAmountUsed: posOrder.loyaltyAmountUsed,
+    giftCodeAmountUsed: posOrder.giftCodeAmountUsed || 0,
+    giftCodeRedemptions: (posOrder.giftCodeRedemptions || []).map((entry) => ({ codeSuffix: entry.codeSuffix, appliedBDT: entry.appliedBDT })),
+    amountDue: Number(posOrder.loyaltyAmountUsed) > 0 || Number(posOrder.giftCodeAmountUsed) > 0 ? posOrder.amountDue : posOrder.total,
     paymentMethod: posOrder.paymentMethod
   };
 
@@ -388,26 +805,37 @@ exports.refundPOSOrder = catchAsyncErrors(async (req, res, next) => {
     return next(new ErrorHandler('POS Order not found', 404));
   }
 
-  if (posOrder.orderStatus === 'refunded') {
-    return next(new ErrorHandler('Order already refunded', 400));
+  const orderTotal = Number(posOrder.total) || 0;
+  const alreadyRefunded = Number(posOrder.refundAmount) || 0;
+  const requestedRefund = Number(refundAmount);
+  const remainingRefundable = Math.max(0, orderTotal - alreadyRefunded);
+  if (!Number.isFinite(requestedRefund) || requestedRefund <= 0 || requestedRefund > remainingRefundable + 0.001) {
+    return next(new ErrorHandler(`Refund must be greater than zero and no more than BDT ${remainingRefundable.toFixed(2)}`, 400));
   }
 
-  posOrder.orderStatus = 'refunded';
-  posOrder.paymentStatus = 'refunded';
-  posOrder.notes = `${posOrder.notes || ''}\nRefund: ${refundAmount} - ${reason}`;
+  posOrder.refundAmount = Math.round((alreadyRefunded + requestedRefund + Number.EPSILON) * 100) / 100;
+  const isFullyRefunded = posOrder.refundAmount >= orderTotal - 0.001;
+  posOrder.paymentStatus = isFullyRefunded ? 'refunded' : 'partially_refunded';
+  if (isFullyRefunded) posOrder.orderStatus = 'refunded';
+  const refundNote = `Refund: BDT ${requestedRefund.toFixed(2)}${reason ? ` - ${String(reason).trim()}` : ''}`;
+  posOrder.notes = [posOrder.notes, refundNote].filter(Boolean).join('\n');
 
-  // Restore inventory items to active status (return assigned stock to available)
-  for (const item of posOrder.items) {
-    await Inventory.findByIdAndUpdate(item.inventoryId, [
-      {
-        $set: {
-          assignedQuantity: 0,
-          availableQuantity: '$stockQuantity',
-          status: 'active',
-          lastUpdated: new Date()
+  // Only a full refund returns all order stock. Partial money refunds do not
+  // imply that inventory was physically returned.
+  if (isFullyRefunded) {
+    for (const item of posOrder.items) {
+      await Inventory.findByIdAndUpdate(item.inventoryId, [
+        {
+          $set: {
+            assignedQuantity: 0,
+            availableQuantity: '$stockQuantity',
+            status: 'active',
+            lastUpdated: new Date()
+          }
         }
-      }
-    ]);
+      ]);
+    }
+    await reversePOSOrderLoyalty(posOrder);
   }
 
   await posOrder.save();
@@ -420,40 +848,46 @@ exports.refundPOSOrder = catchAsyncErrors(async (req, res, next) => {
 
 // Delete POS order
 exports.deletePOSOrder = catchAsyncErrors(async (req, res, next) => {
-  const posOrder = await POSOrder.findById(req.params.id);
-  if (!posOrder) {
-    return next(new ErrorHandler('POS Order not found', 404));
-  }
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const posOrder = await POSOrder.findById(req.params.id).session(session);
+    if (!posOrder) {
+      await session.abortTransaction();
+      return next(new ErrorHandler('POS Order not found', 404));
+    }
 
-  // Restore inventory items to active status before deleting order
-  for (const item of posOrder.items) {
-    await Inventory.findByIdAndUpdate(item.inventoryId, [
-      {
-        $set: {
-          assignedQuantity: 0,
-          availableQuantity: '$stockQuantity',
-          status: 'active',
-          lastUpdated: new Date()
+    // Keep stock and wallet changes atomic with the POS order deletion.
+    for (const item of posOrder.items) {
+      await Inventory.findByIdAndUpdate(item.inventoryId, [
+        {
+          $set: {
+            assignedQuantity: 0,
+            availableQuantity: '$stockQuantity',
+            status: 'active',
+            lastUpdated: new Date()
+          }
         }
-      }
-    ]);
+      ], { session });
+    }
+    await reversePOSOrderLoyalty(posOrder, session);
+    await POSOrder.findByIdAndDelete(req.params.id).session(session);
+    await session.commitTransaction();
+    return res.status(200).json({ success: true, message: 'POS Order deleted and loyalty balance reconciled' });
+  } catch (error) {
+    if (session.inTransaction()) await session.abortTransaction();
+    throw error;
+  } finally {
+    await session.endSession();
   }
-
-  // Delete the POS order
-  await POSOrder.findByIdAndDelete(req.params.id);
-
-  res.status(200).json({
-    success: true,
-    message: 'POS Order deleted successfully'
-  });
 });
 
 // Email a copy of the receipt/invoice to the customer
 exports.sendPOSInvoiceEmail = catchAsyncErrors(async (req, res, next) => {
   const posOrder = await POSOrder.findById(req.params.id)
     .populate('cashier', 'firstName lastName')
-    .populate('items.productId', 'name')
-    .populate('items.inventoryId', 'barcode');
+    .populate('items.productId', 'name sku mainImage measureType unitName variants')
+    .populate(inventoryVariantPopulate);
 
   if (!posOrder) {
     return next(new ErrorHandler('POS Order not found', 404));
@@ -463,7 +897,7 @@ exports.sendPOSInvoiceEmail = catchAsyncErrors(async (req, res, next) => {
     return next(new ErrorHandler('This order has no customer email address', 400));
   }
 
-  const result = await sendPOSReceipt(posOrder);
+  const result = await sendPOSReceiptWithPdf(posOrder);
   if (!result.success) {
     return next(new ErrorHandler(result.message || result.error || 'Failed to send invoice email', 500));
   }
