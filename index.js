@@ -73,6 +73,20 @@ connectDB();
 const app = express();
 const server = http.createServer(app);
 
+// Render/Vercel origin values are easy to paste with a trailing slash. Browsers
+// send the Origin header without one, so normalize configured values before
+// comparing them. CLIENT_URL may contain a comma-separated list for the
+// production domain and Vercel preview/deployment domains.
+const normalizeOrigin = (value) => value.trim().replace(/\/+$/, '');
+const allowedClientOrigins = (process.env.CLIENT_URL || 'http://localhost:5173')
+  .split(',')
+  .map(normalizeOrigin)
+  .filter(Boolean);
+const allowClientOrigin = (origin, callback) => {
+  if (!origin) return callback(null, true);
+  return callback(null, allowedClientOrigins.includes(normalizeOrigin(origin)));
+};
+
 // ==============================
 // Middleware
 // ==============================
@@ -86,7 +100,7 @@ app.use(helmet({
   strictTransportSecurity: process.env.NODE_ENV === 'production' ? undefined : false,
 }));
 app.use(cors({
-  origin: process.env.CLIENT_URL || "http://localhost:5173",
+  origin: allowClientOrigin,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
   credentials: true,
 }));
@@ -148,7 +162,7 @@ const io = socketIO(server, {
   // short URLs. This avoids accepting megabyte-sized websocket payloads.
   maxHttpBufferSize: 64 * 1024,
   cors: {
-    origin: process.env.CLIENT_URL || "http://localhost:5173",
+    origin: allowClientOrigin,
     methods: ["GET", "POST"],
     credentials: true,
   },
