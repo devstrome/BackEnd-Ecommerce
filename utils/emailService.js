@@ -125,13 +125,13 @@ const sendAdminOrderNotification = async (order, user = {}, event = 'new_order')
   const safePhone = escapeEmailHtml(order?.shippingAddress?.phone || 'Not provided');
   const itemRows = (order?.items || []).map((item) => {
     const variant = [item.color, formatMeasureText(item)].filter(Boolean).join(' · ');
-    return `<tr><td style="padding:9px;border-bottom:1px solid #eee">${escapeEmailHtml(item.name || 'Product')}${variant ? `<br><span style="color:#666;font-size:12px">${escapeEmailHtml(variant)}</span>` : ''}</td><td style="padding:9px;border-bottom:1px solid #eee;text-align:center">${Math.max(0, Number(item.quantity) || 0)}</td><td style="padding:9px;border-bottom:1px solid #eee;text-align:right">${formatCurrency((Number(item.price) || 0) * (Number(item.quantity) || 0))}</td></tr>`;
+    return `<tr><td style="width:68px;padding:8px;border-bottom:1px solid #eee;vertical-align:top">${emailItemImage(item, 56)}</td><td style="padding:9px;border-bottom:1px solid #eee;vertical-align:top">${escapeEmailHtml(item.name || 'Product')}${variant ? `<br><span style="color:#666;font-size:12px">${escapeEmailHtml(variant)}</span>` : ''}</td><td style="padding:9px;border-bottom:1px solid #eee;text-align:center;vertical-align:top">${Math.max(0, Number(item.quantity) || 0)}</td><td style="padding:9px;border-bottom:1px solid #eee;text-align:right;vertical-align:top">${formatCurrency((Number(item.price) || 0) * (Number(item.quantity) || 0))}</td></tr>`;
   }).join('');
   const dashboardUrl = publicSiteUrl('/admin/dashboard/orders');
   const amountDue = Number.isFinite(Number(order?.amountDue))
     ? Number(order.amountDue)
     : Math.max(0, Number(order?.grandTotal || order?.totalAmount || 0) - Number(order?.loyaltyAmountUsed || 0));
-  const html = `<div style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto;color:#222"><header style="padding:20px;background:#8F0E2F;color:#fff"><h1 style="font-size:20px;margin:0">${BRAND.NAME} · Admin order alert</h1><p style="margin:7px 0 0">${escapeEmailHtml(label)} · #${safeOrderNumber}</p></header><main style="padding:22px;border:1px solid #eee"><h2 style="margin:0 0 12px;font-size:18px">Customer and order details</h2><p style="margin:5px 0"><strong>Customer:</strong> ${safeName}</p><p style="margin:5px 0"><strong>Email:</strong> ${safeEmail}</p><p style="margin:5px 0"><strong>Phone:</strong> ${safePhone}</p><p style="margin:5px 0"><strong>Order status:</strong> ${escapeEmailHtml(order?.orderStatus || 'pending')}</p><p style="margin:5px 0"><strong>Payment:</strong> ${escapeEmailHtml(order?.paymentMethod || '—')} · ${escapeEmailHtml(order?.paymentStatus || 'pending')}</p><table role="presentation" style="width:100%;border-collapse:collapse;margin:18px 0"><thead><tr style="text-align:left;background:#f8f8f8"><th style="padding:9px">Item</th><th style="padding:9px;text-align:center">Qty</th><th style="padding:9px;text-align:right">Total</th></tr></thead><tbody>${itemRows || '<tr><td colspan="3" style="padding:9px">No order items</td></tr>'}</tbody></table><p><strong>Subtotal:</strong> ${formatCurrency(order?.totalAmount || 0)}</p><p><strong>Shipping:</strong> ${formatCurrency(order?.shippingCost || 0)}</p><p><strong>Amount due:</strong> ${formatCurrency(amountDue)}</p><p><strong>Delivery address:</strong> ${escapeEmailHtml([order?.shippingAddress?.address, order?.shippingAddress?.city, order?.shippingAddress?.state, order?.shippingAddress?.postalCode, order?.shippingAddress?.country].filter(Boolean).join(', ') || 'Not provided')}</p><p style="margin-top:22px"><a href="${escapeEmailHtml(dashboardUrl)}" style="display:inline-block;padding:11px 18px;background:#B1123B;color:#fff;text-decoration:none;border-radius:5px">Open order dashboard</a></p><p style="font-size:12px;color:#777">This admin summary does not include transaction secrets or digital access credentials.</p></main></div>`;
+  const html = `<div style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto;color:#222"><header style="padding:20px;background:#8F0E2F;color:#fff"><h1 style="font-size:20px;margin:0">${BRAND.NAME} · Admin order alert</h1><p style="margin:7px 0 0">${escapeEmailHtml(label)} · #${safeOrderNumber}</p></header><main style="padding:22px;border:1px solid #eee"><h2 style="margin:0 0 12px;font-size:18px">Customer and order details</h2><p style="margin:5px 0"><strong>Customer:</strong> ${safeName}</p><p style="margin:5px 0"><strong>Email:</strong> ${safeEmail}</p><p style="margin:5px 0"><strong>Phone:</strong> ${safePhone}</p><p style="margin:5px 0"><strong>Order status:</strong> ${escapeEmailHtml(order?.orderStatus || 'pending')}</p><p style="margin:5px 0"><strong>Payment:</strong> ${escapeEmailHtml(order?.paymentMethod || '—')} · ${escapeEmailHtml(order?.paymentStatus || 'pending')}</p><table role="presentation" style="width:100%;border-collapse:collapse;margin:18px 0"><thead><tr style="text-align:left;background:#f8f8f8"><th style="width:68px;padding:9px">Image</th><th style="padding:9px">Item</th><th style="padding:9px;text-align:center">Qty</th><th style="padding:9px;text-align:right">Total</th></tr></thead><tbody>${itemRows || '<tr><td colspan="4" style="padding:9px">No order items</td></tr>'}</tbody></table><p><strong>Subtotal:</strong> ${formatCurrency(order?.totalAmount || 0)}</p><p><strong>Shipping:</strong> ${formatCurrency(order?.shippingCost || 0)}</p><p><strong>Amount due:</strong> ${formatCurrency(amountDue)}</p><p><strong>Delivery address:</strong> ${escapeEmailHtml([order?.shippingAddress?.address, order?.shippingAddress?.city, order?.shippingAddress?.state, order?.shippingAddress?.postalCode, order?.shippingAddress?.country].filter(Boolean).join(', ') || 'Not provided')}</p><p style="margin-top:22px"><a href="${escapeEmailHtml(dashboardUrl)}" style="display:inline-block;padding:11px 18px;background:#B1123B;color:#fff;text-decoration:none;border-radius:5px">Open order dashboard</a></p><p style="font-size:12px;color:#777">This admin summary does not include transaction secrets or digital access credentials.</p></main></div>`;
   const textItems = (order?.items || []).map((item) => `${item.name || 'Product'} × ${item.quantity} — ${formatCurrency((Number(item.price) || 0) * (Number(item.quantity) || 0))}`).join('\n');
   return sendSuperAdminNotification({
     subject: `[${BRAND.NAME}] ${label} #${orderNumber}`,
@@ -173,6 +173,43 @@ const formatDate = (date) => {
 const escapeEmailHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
 }[char]));
+
+const getEmailImageUrl = (value) => {
+  if (Array.isArray(value)) return getEmailImageUrl(value[0]);
+  const candidate = typeof value === 'string'
+    ? value
+    : value?.secure_url || value?.url || value?.src || value?.path || '';
+  const normalized = String(candidate || '').trim();
+  if (!normalized) return '';
+  try {
+    const parsed = new URL(normalized.startsWith('//') ? `https:${normalized}` : normalized);
+    if (!['https:', 'http:'].includes(parsed.protocol)) return '';
+    if (/^(localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0)$/i.test(parsed.hostname) || parsed.hostname.endsWith('.local')) return '';
+    return parsed.href;
+  } catch {
+    return '';
+  }
+};
+
+// Use fixed-size, table-friendly image markup because email clients often
+// strip flex/grid styles and the order snapshots may store images as objects.
+const emailItemImage = (item, size = 80) => {
+  const source = [
+    item?.variantImage,
+    item?.mainImage,
+    item?.imageUrl,
+    item?.image,
+    item?.productId?.mainImage,
+    item?.product?.mainImage,
+    item?.variantInfo?.imageUrl,
+    item?.variantId?.imageUrl,
+    item?.images,
+  ].map(getEmailImageUrl).find(Boolean);
+  const dimension = Math.max(32, Math.min(120, Math.floor(Number(size) || 80)));
+  const alt = escapeEmailHtml(item?.name || item?.productName || 'Product');
+  if (!source) return `<span style="display:block;width:${dimension}px;height:${dimension}px;line-height:${dimension}px;text-align:center;background:#f3f4f6;border:1px solid #e5e7eb;color:#9ca3af;font-size:10px">No image</span>`;
+  return `<img src="${escapeEmailHtml(source)}" alt="${alt}" width="${dimension}" height="${dimension}" style="display:block;width:${dimension}px;height:${dimension}px;object-fit:contain;background:#fff;border:1px solid #e5e7eb">`;
+};
 
 const formatMeasureHtml = (item) => {
   const { label, value } = formatMeasureParts(item);
@@ -315,7 +352,7 @@ const emailTemplates = {
               <div style="border-bottom: 1px solid #eee; padding: 15px 0; ${index === order.items.length - 1 ? 'border-bottom: none;' : ''}">
                 <div style="display: flex; gap: 15px; align-items: start;">
                   <div style="width: 100px; height: 100px; background: #f3f4f6; border-radius: 8px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; border: 1px solid #e5e7eb;">
-                    ${item.mainImage ? `<img src="${item.mainImage}" alt="${item.name}" style="width: 100%; height: 100%; object-fit: contain; border-radius: 8px; max-width: 100%; max-height: 100%;">` : '<span style="color: #9ca3af;">No Image</span>'}
+                    ${emailItemImage(item, 98)}
                   </div>
                   <div style="flex: 1;">
                     <h4 style="margin: 0 0 8px 0; color: #374151;">${item.name}</h4>
@@ -462,7 +499,7 @@ const emailTemplates = {
               ${order.items.map(item => `
                 <div style="border: 1px solid #e5e7eb; border-radius: 8px; padding: 15px;">
                   <div style="width: 80px; height: 80px; background: #f3f4f6; border-radius: 8px; margin-bottom: 10px; display: flex; align-items: center; justify-content: center; border: 1px solid #e5e7eb;">
-                    ${item.mainImage ? `<img src="${item.mainImage}" alt="${item.name}" style="width: 100%; height: 100%; object-fit: contain; border-radius: 8px; max-width: 100%; max-height: 100%;">` : '<span style="color: #9ca3af; font-size: 12px;">No Image</span>'}
+                    ${emailItemImage(item, 78)}
                   </div>
                   <h4 style="margin: 0 0 5px 0; font-size: 14px; color: #374151;">${item.name}</h4>
                   <p style="margin: 3px 0; font-size: 12px; color: #6b7280;">Qty: ${item.quantity}</p>
@@ -554,7 +591,7 @@ const emailTemplates = {
               ${order.items.map(item => `
                 <div style="border: 1px solid #e5e7eb; border-radius: 8px; padding: 15px;">
                   <div style="width: 80px; height: 80px; background: #f3f4f6; border-radius: 8px; margin-bottom: 10px; display: flex; align-items: center; justify-content: center; border: 1px solid #e5e7eb;">
-                    ${item.mainImage ? `<img src="${item.mainImage}" alt="${item.name}" style="width: 100%; height: 100%; object-fit: contain; border-radius: 8px; max-width: 100%; max-height: 100%;">` : '<span style="color: #9ca3af; font-size: 12px;">No Image</span>'}
+                    ${emailItemImage(item, 78)}
                   </div>
                   <h4 style="margin: 0 0 5px 0; font-size: 14px; color: #374151;">${item.name}</h4>
                   <p style="margin: 3px 0; font-size: 12px; color: #6b7280;">Qty: ${item.quantity}</p>
@@ -663,7 +700,7 @@ const emailTemplates = {
               ${order.items.map(item => `
                 <div style="border: 1px solid #e5e7eb; border-radius: 8px; padding: 15px;">
                   <div style="width: 80px; height: 80px; background: #f3f4f6; border-radius: 8px; margin-bottom: 10px; display: flex; align-items: center; justify-content: center; border: 1px solid #e5e7eb;">
-                    ${item.mainImage ? `<img src="${item.mainImage}" alt="${item.name}" style="width: 100%; height: 100%; object-fit: contain; border-radius: 8px; max-width: 100%; max-height: 100%;">` : '<span style="color: #9ca3af; font-size: 12px;">No Image</span>'}
+                    ${emailItemImage(item, 78)}
                   </div>
                   <h4 style="margin: 0 0 5px 0; font-size: 14px; color: #374151;">${item.name}</h4>
                   <p style="margin: 3px 0; font-size: 12px; color: #6b7280;">Qty: ${item.quantity}</p>
@@ -735,11 +772,10 @@ const emailTemplates = {
       const unitPrice = Number(item.discountPrice) > 0 ? Number(item.discountPrice) : Number(item.unitPrice) || 0;
       const qty = Math.max(1, Number(item.quantity) || 1);
       const totalPrice = Number.isFinite(Number(item.totalPrice)) ? Number(item.totalPrice) : unitPrice * qty;
-      const image = variant.imageUrl || '';
       return `
         <tr style="border-bottom:1px solid #e5e7eb">
           <td style="padding:10px;vertical-align:top">
-            ${image ? `<img src="${escapeHtml(image)}" alt="" width="54" height="54" style="display:block;width:54px;height:54px;object-fit:contain;border:1px solid #eee;margin-bottom:6px">` : ''}
+            ${emailItemImage({ ...item, variantImage: variant.imageUrl || item.variantImage, name: item.productName }, 54)}
             <strong>${escapeHtml(item.productName || 'Product')}</strong>
             ${detailParts.length ? `<br><span style="font-size:12px;line-height:1.6;color:#666">${detailParts.map(escapeHtml).join('<br>')}</span>` : ''}
           </td>
@@ -950,17 +986,12 @@ const sendLoyaltyTierEmail = async ({ user, tierName, earnRatePercent }) => {
 const sendDigitalProductCodesEmail = async ({ user, order, itemGroups, isManualFulfillment = false }) => {
   const name = escapeEmailHtml(user?.firstName || user?.fullName || 'there');
   const safeOrderId = escapeEmailHtml(order?.orderId || order?._id || '');
-  const orderUrl = publicSiteUrl(`/profile/orders/${encodeURIComponent(order?.orderId || order?._id || '')}#digital-delivery`);
-  const copyLink = (group, field) => {
-    const anchor = group?.itemId ? `#digital-${encodeURIComponent(group.itemId)}-${encodeURIComponent(field)}` : '#digital-delivery';
-    return `<a href="${escapeEmailHtml(`${orderUrl.split('#')[0]}${anchor}`)}" style="display:inline-block;margin-left:8px;padding:5px 9px;border:1px solid #e5b7c4;border-radius:5px;color:#8F0E2F;text-decoration:none;font-size:12px;font-weight:bold">View &amp; copy</a>`;
-  };
   const htmlItems = (itemGroups || []).map((group) => `
     <section style="margin:18px 0;padding:16px;border:1px solid #eee;border-radius:8px">
       <h3 style="margin:0 0 8px;color:#8F0E2F">${escapeEmailHtml(group.productName)}</h3>
       ${group.variantName ? `<p style="margin:0 0 10px;color:#666">${escapeEmailHtml(group.variantName)}</p>` : ''}
-      ${(group.codes || []).map((code, index) => `<p style="margin:8px 0"><strong>Code ${index + 1}:</strong> <code style="padding:5px 8px;background:#f7f5f3;border-radius:4px;white-space:pre-wrap;word-break:break-all">${escapeEmailHtml(code)}</code>${copyLink(group, `code-${index}`)}</p>`).join('')}
-      ${(group.details || []).map(({ field, label, value }) => `<p style="margin:8px 0"><strong>${escapeEmailHtml(label)}:</strong> <span style="white-space:pre-wrap;word-break:break-word">${escapeEmailHtml(value)}</span>${copyLink(group, field || 'digital-delivery')}</p>`).join('')}
+      ${(group.codes || []).map((code, index) => `<p style="margin:8px 0"><strong>Code ${index + 1}:</strong><br><code style="display:inline-block;margin-top:4px;padding:7px 9px;background:#f7f5f3;border:1px solid #eee;border-radius:4px;white-space:pre-wrap;word-break:break-all;user-select:all">${escapeEmailHtml(code)}</code></p>`).join('')}
+      ${(group.details || []).map(({ label, value }) => `<p style="margin:8px 0"><strong>${escapeEmailHtml(label)}:</strong><br><span style="display:inline-block;margin-top:4px;padding:7px 9px;background:#f7f5f3;border:1px solid #eee;border-radius:4px;white-space:pre-wrap;word-break:break-word;user-select:all">${escapeEmailHtml(value)}</span></p>`).join('')}
     </section>`).join('');
   const textItems = (itemGroups || []).map((group) => `${group.productName}${group.variantName ? ` (${group.variantName})` : ''}\n${(group.codes || []).map((code, index) => `Code ${index + 1}: ${code}`).join('\n')}${(group.details || []).map(({ label, value }) => `${label}: ${value}`).join('\n')}`).join('\n\n');
   const heading = isManualFulfillment ? 'Your digital delivery details' : 'Your digital items are ready';
@@ -970,8 +1001,8 @@ const sendDigitalProductCodesEmail = async ({ user, order, itemGroups, isManualF
   return sendCustomEmail({
     to: user.email,
     subject: `${BRAND.NAME} digital delivery — Order #${order?.orderId || ''}`,
-    html: `<div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;color:#1b1b1b"><div style="padding:24px"><h2 style="color:#8F0E2F">${heading}</h2><p>Hello ${name},</p><p>${intro}</p><p style="font-size:13px;color:#666">Your email app may not support copying directly. Use each “View &amp; copy” link to open this order and copy a field securely.</p>${htmlItems}<p style="color:#666;font-size:12px">If you need help, contact our support team and mention order #${safeOrderId}.</p></div></div>`,
-    text: `Hello ${user?.firstName || user?.fullName || 'there'}, your digital delivery details for order #${order?.orderId || ''} are below. Keep them private.\n\n${textItems}\n\nView the order and use its copy controls: ${orderUrl}`,
+    html: `<div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;color:#1b1b1b"><div style="padding:24px"><h2 style="color:#8F0E2F">${heading}</h2><p>Hello ${name},</p><p>${intro}</p><p style="font-size:13px;color:#666">To copy a code or access detail, select the text in this email and choose Copy. Email apps block clipboard buttons, so the values are shown directly for easy selection.</p>${htmlItems}<p style="color:#666;font-size:12px">If you need help, contact our support team and mention order #${safeOrderId}.</p></div></div>`,
+    text: `Hello ${user?.firstName || user?.fullName || 'there'}, your digital delivery details for order #${order?.orderId || ''} are below. Keep them private.\n\n${textItems}\n\nSelect and copy codes or access details directly from this email.`,
   });
 };
 
@@ -1066,7 +1097,7 @@ const sendOrderCancelled = async (order, user) => {
               ${order.items.map(item => `
                 <div class="item">
                   <div class="item-image">
-                    ${item.mainImage ? `<img src="${item.mainImage}" alt="${item.name}">` : '<span style="color: #9ca3af;">No Image</span>'}
+                    ${emailItemImage(item, 78)}
                   </div>
                   <div class="item-details">
                     <div class="item-name">${item.name}</div>
@@ -1235,7 +1266,7 @@ const sendOrderFinalization = async (order, user) => {
               ${order.items.map(item => `
                 <div class="item">
                   <div class="item-image">
-                    ${item.mainImage ? `<img src="${item.mainImage}" alt="${item.name}">` : '<span style="color: #9ca3af;">No Image</span>'}
+                    ${emailItemImage(item, 78)}
                   </div>
                   <div class="item-details">
                     <div class="item-name">${item.name}</div>

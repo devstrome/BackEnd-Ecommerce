@@ -39,6 +39,7 @@ exports.getMyLoyalty = async (req, res) => {
       tierName: account.tierName || '',
       earnRatePercent: account.earnRatePercent ?? settings.earnRatePercent,
       tierAssignedAt: account.tierAssignedAt || null,
+      redemptionFrozen: Boolean(account.redemptionFrozen),
       maxRedeemPercent: settings.maxRedeemPercent,
       enabled: settings.enabled,
     });
@@ -77,11 +78,73 @@ exports.listLoyaltyCustomers = async (req, res) => {
         tierName: account?.tierName || '',
         earnRatePercent: account?.earnRatePercent ?? null,
         tierAssignedAt: account?.tierAssignedAt || null,
+        redemptionFrozen: Boolean(account?.redemptionFrozen),
       };
     });
     return res.json({ success: true, customers });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message || 'Unable to load loyalty customers' });
+  }
+};
+
+exports.getAdminCustomerLoyalty = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!mongoose.isValidObjectId(userId)) return res.status(400).json({ success: false, message: 'Invalid customer ID' });
+    const user = await User.findById(userId).select('firstName lastName fullName email');
+    if (!user) return res.status(404).json({ success: false, message: 'Customer not found' });
+    const [account, transactions, settings] = await Promise.all([
+      getLoyaltyAccount(userId),
+      LoyaltyTransaction.find({ userId }).sort({ createdAt: -1 }).limit(30).lean(),
+      getLoyaltySettings(),
+    ]);
+    return res.json({
+      success: true,
+      customer: {
+        userId: String(user._id),
+        fullName: user.fullName || [user.firstName, user.lastName].filter(Boolean).join(' '),
+        email: user.email || '',
+        balanceBDT: roundBDT(account.balanceBDT),
+        tierName: account.tierName || '',
+        earnRatePercent: account.earnRatePercent ?? settings.earnRatePercent,
+        redemptionFrozen: Boolean(account.redemptionFrozen),
+        redemptionFrozenAt: account.redemptionFrozenAt || null,
+      },
+      transactions,
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message || 'Unable to load customer loyalty details' });
+  }
+};
+
+exports.setCustomerRedemptionFrozen = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!mongoose.isValidObjectId(userId)) return res.status(400).json({ success: false, message: 'Invalid customer ID' });
+    if (typeof req.body?.frozen !== 'boolean') return res.status(400).json({ success: false, message: 'Choose whether loyalty redemption should be frozen' });
+    if (!await User.exists({ _id: userId })) return res.status(404).json({ success: false, message: 'Customer not found' });
+    const frozen = req.body.frozen;
+    const account = await LoyaltyAccount.findOneAndUpdate(
+      { userId },
+      {
+        $set: {
+          redemptionFrozen: frozen,
+          redemptionFrozenAt: frozen ? new Date() : null,
+          redemptionFrozenBy: frozen ? (req.admin?.id || req.admin?._id || null) : null,
+        },
+        $setOnInsert: { userId, balanceBDT: 0 },
+      },
+      { new: true, upsert: true, setDefaultsOnInsert: true, runValidators: true },
+    );
+    return res.json({
+      success: true,
+      balanceBDT: roundBDT(account.balanceBDT),
+      redemptionFrozen: Boolean(account.redemptionFrozen),
+      redemptionFrozenAt: account.redemptionFrozenAt || null,
+      message: frozen ? 'Loyalty redemption is frozen for this customer' : 'Loyalty redemption is active for this customer',
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message || 'Unable to update loyalty redemption status' });
   }
 };
 
@@ -145,7 +208,7 @@ exports.redeemGiftCode = async (req, res) => {
     const now = new Date();
     const gift = await LoyaltyGiftCode.findOneAndUpdate(
       { codeHash: hashCode(code), status: 'active', $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }] },
-      { $set: { status: 'redeemed', redeemedBy: userId, redeemedAt: now } },
+      { $set: { status: 'redeemed', redeemedBy: userId, redeemedAt: now, redeemedVia: 'loyalty_balance', redeemedPOSOrderNumber: '' } },
       { new: true, session },
     );
     if (!gift) throw Object.assign(new Error('This code is invalid, expired, or has already been redeemed'), { statusCode: 404 });
@@ -249,7 +312,7 @@ exports.createGiftCodes = async (req, res) => {
 
 exports.listGiftCodes = async (req, res) => {
   try {
-    const rows = await LoyaltyGiftCode.find().select('+codeEncrypted amountBDT codeSuffix status expiresAt redeemedAt createdAt batchId')
+    const rows = await LoyaltyGiftCode.find().select('+codeEncrypted amountBDT codeSuffix status expiresAt redeemedAt redeemedVia redeemedPOSOrderNumber createdAt batchId')
       .populate('redeemedBy', 'firstName lastName email')
       .sort({ createdAt: -1 }).limit(300).lean();
     const codes = rows.map(({ codeEncrypted, ...gift }) => {

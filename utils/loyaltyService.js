@@ -41,7 +41,7 @@ const getLoyaltySettings = async (session = null) => LoyaltySettings.findOneAndU
 );
 
 const changeLoyaltyBalance = async ({
-  userId, amountBDT, direction, source, idempotencyKey, referenceId = '', note = '', createdBy = null, session = null, allowNegative = false,
+  userId, amountBDT, direction, source, idempotencyKey, referenceId = '', note = '', createdBy = null, session = null, allowNegative = false, requireUnfrozen = false,
 }) => {
   const amount = roundBDT(amountBDT);
   if (!userId || !Number.isFinite(amount) || amount <= 0 || !['credit', 'debit'].includes(direction)) {
@@ -52,13 +52,20 @@ const changeLoyaltyBalance = async ({
 
   await getLoyaltyAccount(userId, session);
   const filter = { userId };
+  if (direction === 'debit' && requireUnfrozen) filter.redemptionFrozen = { $ne: true };
   if (direction === 'debit' && !allowNegative) filter.balanceBDT = { $gte: amount };
   const updatedAccount = await LoyaltyAccount.findOneAndUpdate(
     filter,
     { $inc: { balanceBDT: direction === 'credit' ? amount : -amount } },
     { new: true, ...(session ? { session } : {}) },
   );
-  if (!updatedAccount) throw new Error('The customer does not have enough BDT balance');
+  if (!updatedAccount) {
+    if (requireUnfrozen) {
+      const account = await LoyaltyAccount.findOne({ userId }).select('redemptionFrozen').session(session || null).lean();
+      if (account?.redemptionFrozen) throw new Error('Customer loyalty redemptions are frozen');
+    }
+    throw new Error('The customer does not have enough BDT balance');
+  }
 
   const transaction = new LoyaltyTransaction({
     userId, direction, amountBDT: amount, balanceAfterBDT: roundBDT(updatedAccount.balanceBDT),

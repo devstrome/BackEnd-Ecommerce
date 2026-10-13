@@ -674,6 +674,10 @@ module.exports.createOrder = async (req, res) => {
     }
     const loyaltySettings = await getLoyaltySettings(session);
     const loyaltyAccount = await getLoyaltyAccount(userId, session);
+    if (requestedLoyaltyAmount > 0 && loyaltyAccount.redemptionFrozen) {
+      await session.abortTransaction();
+      return res.status(403).json({ message: 'Loyalty redemption is frozen for this account. Contact the store for help.' });
+    }
     const getLoyaltyUse = (total) => Math.round(Math.min(
       requestedLoyaltyAmount,
       Number(loyaltyAccount.balanceBDT || 0),
@@ -766,6 +770,7 @@ module.exports.createOrder = async (req, res) => {
         note: `Loyalty balance used on order #${newOrder.orderId}`,
         idempotencyKey: `order:${newOrder._id}:redeem`,
         session,
+        requireUnfrozen: true,
       });
     }
     if (newOrder.paymentStatus === 'completed') {

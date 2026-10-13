@@ -20,10 +20,10 @@ const {
 } = require('../utils/loyaltyService');
 
 const reversePOSOrderLoyalty = async (posOrder, session = null) => {
-  if (!posOrder?.loyaltyUserId) return;
-  if (Number(posOrder.loyaltyAmountUsed || 0) > 0) {
+  const loyaltyUserId = posOrder?.loyaltyUserId || null;
+  if (loyaltyUserId && Number(posOrder.loyaltyAmountUsed || 0) > 0) {
     await changeLoyaltyBalance({
-      userId: posOrder.loyaltyUserId,
+      userId: loyaltyUserId,
       amountBDT: posOrder.loyaltyAmountUsed,
       direction: 'credit',
       source: 'pos_refund',
@@ -33,9 +33,9 @@ const reversePOSOrderLoyalty = async (posOrder, session = null) => {
       session,
     });
   }
-  if (Number(posOrder.loyaltyRewardEarned || 0) > 0) {
+  if (loyaltyUserId && Number(posOrder.loyaltyRewardEarned || 0) > 0) {
     await changeLoyaltyBalance({
-      userId: posOrder.loyaltyUserId,
+      userId: loyaltyUserId,
       amountBDT: posOrder.loyaltyRewardEarned,
       direction: 'debit',
       source: 'pos_refund',
@@ -47,9 +47,9 @@ const reversePOSOrderLoyalty = async (posOrder, session = null) => {
     });
   }
   for (const redemption of posOrder.giftCodeRedemptions || []) {
-    if (Number(redemption.balanceCreditedBDT || 0) > 0) {
+    if (loyaltyUserId && Number(redemption.balanceCreditedBDT || 0) > 0) {
       await changeLoyaltyBalance({
-        userId: posOrder.loyaltyUserId,
+        userId: loyaltyUserId,
         amountBDT: redemption.balanceCreditedBDT,
         direction: 'debit',
         source: 'pos_refund',
@@ -61,8 +61,8 @@ const reversePOSOrderLoyalty = async (posOrder, session = null) => {
       });
     }
     await LoyaltyGiftCode.updateOne(
-      { _id: redemption.giftCodeId, status: 'redeemed', redeemedBy: posOrder.loyaltyUserId, redeemedAt: redemption.redeemedAt },
-      { $set: { status: 'active', redeemedBy: null, redeemedAt: null } },
+      { _id: redemption.giftCodeId, status: 'redeemed', redeemedBy: loyaltyUserId, redeemedAt: redemption.redeemedAt },
+      { $set: { status: 'active', redeemedBy: null, redeemedAt: null, redeemedVia: null, redeemedPOSOrderNumber: '' } },
       session ? { session } : {},
     );
   }
@@ -237,6 +237,7 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
     discount,
     total,
     paymentMethod,
+    paymentDetails,
     outlet,
     notes,
     loyaltyUserId,
@@ -247,6 +248,11 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
   // Validate items and check inventory
   if (!Array.isArray(items) || items.length === 0) {
     return next(new ErrorHandler('Order must contain at least one item', 400));
+  }
+
+  const trxId = String(paymentDetails?.trxId || '').trim();
+  if (paymentMethod === 'mobile_payment' && !/^[a-z0-9]{8,100}$/i.test(trxId)) {
+    return next(new ErrorHandler('Enter a valid mobile payment transaction ID (at least 8 letters or numbers)', 400));
   }
 
   const seenInventoryIds = new Set();
@@ -337,9 +343,6 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
     return next(new ErrorHandler('Look up and select a loyalty customer before applying BDT', 400));
   }
   const normalizedGiftCode = String(loyaltyGiftCode || '').trim().toUpperCase();
-  if (normalizedGiftCode && !mongoose.isValidObjectId(loyaltyUserId)) {
-    return next(new ErrorHandler('Look up and select a loyalty customer before redeeming a gift code', 400));
-  }
   if (normalizedGiftCode.length > 100) return next(new ErrorHandler('Gift code is invalid', 400));
 
   // Generate unique order number
@@ -352,6 +355,9 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
     if (loyaltyUserId && !member) throw new ErrorHandler('Loyalty customer was not found', 404);
     const settings = await getLoyaltySettings(session);
     const account = member ? await getLoyaltyAccount(member._id, session) : null;
+    if (requestedLoyalty > 0 && account?.redemptionFrozen) {
+      throw new ErrorHandler('Loyalty redemption is frozen for this customer', 403);
+    }
     const redeemLimit = settings.enabled ? orderTotal * Number(settings.maxRedeemPercent || 0) / 100 : 0;
     const loyaltyUsed = Math.round(Math.min(requestedLoyalty, Number(account?.balanceBDT || 0), redeemLimit, orderTotal) * 100) / 100;
     let giftCodeRecord = null;
@@ -362,13 +368,22 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
       const now = new Date();
       giftCodeRecord = await LoyaltyGiftCode.findOneAndUpdate(
         { codeHash: hashCode(normalizedGiftCode), status: 'active', $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }] },
-        { $set: { status: 'redeemed', redeemedBy: member._id, redeemedAt: now } },
+        { $set: {
+          status: 'redeemed',
+          redeemedBy: member?._id || null,
+          redeemedAt: now,
+          redeemedVia: 'pos',
+          redeemedPOSOrderNumber: orderNumber,
+        } },
         { new: true, session },
       );
       if (!giftCodeRecord) throw new ErrorHandler('Gift code is invalid, expired, or already redeemed', 400);
       giftCodeRedeemedAt = now;
       giftCodeApplied = Math.round(Math.min(Number(giftCodeRecord.amountBDT) || 0, Math.max(0, orderTotal - loyaltyUsed)) * 100) / 100;
       giftCodeBalanceCredited = Math.round(Math.max(0, Number(giftCodeRecord.amountBDT) - giftCodeApplied) * 100) / 100;
+      if (giftCodeBalanceCredited > 0 && !member) {
+        throw new ErrorHandler('Gift code value exceeds the sale total. Add items to use its full value, or select a loyalty customer to credit the remainder.', 400);
+      }
     }
     const rewardEarned = member ? await calculateOrderReward({ userId: member._id, totalAmount: orderSubtotal, discountAmount: orderDiscount }, session) : 0;
 
@@ -399,6 +414,7 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
       discount: orderDiscount,
       total: orderTotal,
       paymentMethod,
+      paymentDetails: paymentMethod === 'mobile_payment' ? { trxId } : {},
       paymentStatus: 'completed',
       orderStatus: 'completed',
       cashier: req.admin.id,
@@ -431,6 +447,7 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
         note: `Loyalty balance used at POS order #${orderNumber}`,
         idempotencyKey: `pos:${orderNumber}:redeem`,
         session,
+        requireUnfrozen: true,
       });
     }
     if (rewardEarned > 0 && member) {
@@ -528,17 +545,14 @@ exports.findLoyaltyCustomer = catchAsyncErrors(async (req, res, next) => {
       earnRatePercent: account?.earnRatePercent ?? loyaltySettings.earnRatePercent,
       enabled: loyaltySettings.enabled,
       maxRedeemPercent: loyaltySettings.maxRedeemPercent,
+      redemptionFrozen: Boolean(account?.redemptionFrozen),
     },
   });
 });
 
 exports.validatePOSGiftCode = catchAsyncErrors(async (req, res, next) => {
   const code = String(req.body?.code || '').trim().toUpperCase();
-  const userId = String(req.body?.userId || '');
   if (code.length < 6 || code.length > 100) return next(new ErrorHandler('Enter a valid gift code', 400));
-  if (!mongoose.isValidObjectId(userId) || !await User.exists({ _id: userId })) {
-    return next(new ErrorHandler('Look up and select a loyalty customer before redeeming a gift code', 400));
-  }
   const now = new Date();
   const gift = await LoyaltyGiftCode.findOne({
     codeHash: hashCode(code),
@@ -787,7 +801,8 @@ exports.printReceipt = catchAsyncErrors(async (req, res, next) => {
     giftCodeAmountUsed: posOrder.giftCodeAmountUsed || 0,
     giftCodeRedemptions: (posOrder.giftCodeRedemptions || []).map((entry) => ({ codeSuffix: entry.codeSuffix, appliedBDT: entry.appliedBDT })),
     amountDue: Number(posOrder.loyaltyAmountUsed) > 0 || Number(posOrder.giftCodeAmountUsed) > 0 ? posOrder.amountDue : posOrder.total,
-    paymentMethod: posOrder.paymentMethod
+    paymentMethod: posOrder.paymentMethod,
+    paymentDetails: posOrder.paymentDetails?.toObject?.() || posOrder.paymentDetails || {},
   };
 
   res.status(200).json({

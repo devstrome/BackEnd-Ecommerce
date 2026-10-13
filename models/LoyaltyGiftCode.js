@@ -11,6 +11,8 @@ const loyaltyGiftCodeSchema = new mongoose.Schema({
   expiresAt: { type: Date, default: null },
   redeemedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   redeemedAt: { type: Date, default: null },
+  redeemedVia: { type: String, enum: ['loyalty_balance', 'pos'], default: null },
+  redeemedPOSOrderNumber: { type: String, trim: true, default: '' },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Admin', required: true },
   batchId: { type: String, required: true, index: true },
 }, { timestamps: true });

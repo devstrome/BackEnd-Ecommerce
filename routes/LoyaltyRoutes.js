@@ -10,6 +10,8 @@ router.post('/loyalty/redeem', authenticate, controller.redeemGiftCode);
 router.get('/admin/loyalty/settings', authenticateAdmin, controller.getAdminSettings);
 router.patch('/admin/loyalty/settings', authenticateAdmin, controller.updateAdminSettings);
 router.get('/admin/loyalty/customers', authenticateAdmin, controller.listLoyaltyCustomers);
+router.get('/admin/loyalty/customers/:userId', authenticateAdmin, controller.getAdminCustomerLoyalty);
+router.patch('/admin/loyalty/customers/:userId/freeze', authenticateAdmin, controller.setCustomerRedemptionFrozen);
 router.post('/admin/loyalty/tiers', authenticateAdmin, controller.assignLoyaltyTier);
 router.get('/admin/loyalty/gift-codes', authenticateAdmin, controller.listGiftCodes);
 router.post('/admin/loyalty/gift-codes', authenticateAdmin, controller.createGiftCodes);

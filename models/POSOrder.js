@@ -1,6 +1,10 @@
 const mongoose = require('mongoose');
 const Schema = mongoose.Schema;
 
+const paymentDetailsSchema = new mongoose.Schema({
+  trxId: { type: String, trim: true, maxlength: 100 },
+}, { _id: false });
+
 const POSOrderSchema = new mongoose.Schema({
   orderNumber: {
     type: String,
@@ -120,6 +124,7 @@ const POSOrderSchema = new mongoose.Schema({
     enum: ['cash', 'card', 'mobile_payment', 'bank_transfer'],
     required: true
   },
+  paymentDetails: { type: paymentDetailsSchema, default: () => ({}) },
   paymentStatus: {
     type: String,
     enum: ['pending', 'completed', 'failed', 'partially_refunded', 'refunded'],
