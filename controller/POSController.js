@@ -358,8 +358,11 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
     if (requestedLoyalty > 0 && account?.redemptionFrozen) {
       throw new ErrorHandler('Loyalty redemption is frozen for this customer', 403);
     }
-    const redeemLimit = settings.enabled ? orderTotal * Number(settings.maxRedeemPercent || 0) / 100 : 0;
-    const loyaltyUsed = Math.round(Math.min(requestedLoyalty, Number(account?.balanceBDT || 0), redeemLimit, orderTotal) * 100) / 100;
+    // Store loyalty balance applies to discounted merchandise only. POS tax is
+    // still payable separately, just like delivery and checkout fees online.
+    const redeemableMerchandise = Math.max(0, orderSubtotal - orderDiscount);
+    const redeemLimit = settings.enabled ? redeemableMerchandise * Number(settings.maxRedeemPercent || 0) / 100 : 0;
+    const loyaltyUsed = Math.round(Math.min(requestedLoyalty, Number(account?.balanceBDT || 0), redeemLimit, redeemableMerchandise) * 100) / 100;
     let giftCodeRecord = null;
     let giftCodeApplied = 0;
     let giftCodeBalanceCredited = 0;
@@ -385,7 +388,12 @@ exports.createPOSOrder = catchAsyncErrors(async (req, res, next) => {
         throw new ErrorHandler('Gift code value exceeds the sale total. Add items to use its full value, or select a loyalty customer to credit the remainder.', 400);
       }
     }
-    const rewardEarned = member ? await calculateOrderReward({ userId: member._id, totalAmount: orderSubtotal, discountAmount: orderDiscount }, session) : 0;
+    const rewardEarned = member ? await calculateOrderReward({
+      userId: member._id,
+      totalAmount: orderSubtotal,
+      discountAmount: orderDiscount,
+      loyaltyAmountUsed: loyaltyUsed,
+    }, session) : 0;
 
     posOrder = new POSOrder({
       orderNumber,

@@ -684,13 +684,15 @@ module.exports.createOrder = async (req, res) => {
       await session.abortTransaction();
       return res.status(403).json({ message: 'Loyalty redemption is frozen for this account. Contact the store for help.' });
     }
-    const getLoyaltyUse = (total) => Math.round(Math.min(
+    // Loyalty balance can pay for discounted merchandise only. Shipping and
+    // checkout fees must remain payable through the selected payment method.
+    const getLoyaltyUse = (merchandiseTotal) => Math.round(Math.min(
       requestedLoyaltyAmount,
       Number(loyaltyAccount.balanceBDT || 0),
-      loyaltySettings.enabled ? Number(total || 0) * Number(loyaltySettings.maxRedeemPercent || 0) / 100 : 0,
-      Number(total || 0),
+      loyaltySettings.enabled ? Number(merchandiseTotal || 0) * Number(loyaltySettings.maxRedeemPercent || 0) / 100 : 0,
+      Number(merchandiseTotal || 0),
     ) * 100) / 100;
-    let loyaltyAmountUsed = getLoyaltyUse(ruleEval.grandTotal);
+    let loyaltyAmountUsed = getLoyaltyUse(ruleEval.orderAmount);
     let amountDue = Math.max(0, Math.round((Number(ruleEval.grandTotal || 0) - loyaltyAmountUsed) * 100) / 100);
 
     if (amountDue <= 0 && requestedPaymentKey !== 'loyalty balance' && requestedPaymentKey !== 'loyalty') {
@@ -702,7 +704,7 @@ module.exports.createOrder = async (req, res) => {
           blockers: loyaltyRuleEval.blockers,
         });
       }
-      const loyaltyRuleUse = getLoyaltyUse(loyaltyRuleEval.grandTotal);
+      const loyaltyRuleUse = getLoyaltyUse(loyaltyRuleEval.orderAmount);
       if (loyaltyRuleUse >= Number(loyaltyRuleEval.grandTotal || 0)) {
         ruleEval = loyaltyRuleEval;
         loyaltyAmountUsed = loyaltyRuleUse;

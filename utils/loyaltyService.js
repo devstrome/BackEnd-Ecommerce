@@ -76,6 +76,9 @@ const changeLoyaltyBalance = async ({
 };
 
 const calculateOrderReward = async (order, session = null) => {
+  // A loyalty redemption is a payment method, not an eligible purchase for
+  // earning another reward on the same order.
+  if (Number(order?.loyaltyAmountUsed || 0) > 0) return 0;
   const settings = await getLoyaltySettings(session);
   if (!settings.enabled) return 0;
   const account = order?.userId ? await getLoyaltyAccount(order.userId, session) : null;
