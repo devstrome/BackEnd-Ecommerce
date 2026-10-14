@@ -24,8 +24,8 @@ const normPhone = (p) => {
   return digits;
 };
 
-// Shop/sender contact sent with every booking (Pathao `sender_phone`,
-// Steadfast `sender_phone`). Overridable via COURIER_SENDER_PHONE.
+// Shop/sender contact sent with Steadfast bookings. Overridable via
+// COURIER_SENDER_PHONE. Pathao order creation does not require sender_phone.
 const SENDER_PHONE = '8801601886367';
 const senderPhone = () =>
   String(process.env.COURIER_SENDER_PHONE || SENDER_PHONE).trim();
@@ -149,7 +149,6 @@ async function pathaoCreateShipment(order) {
   const payload = {
     store_id: storeId,
     merchant_order_id: order.orderId || String(order._id),
-    sender_phone: senderPhone(),
     recipient_name: recipientName,
     recipient_phone: phone,
     recipient_address: recipientAddress,
