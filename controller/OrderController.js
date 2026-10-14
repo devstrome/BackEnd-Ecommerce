@@ -15,6 +15,12 @@ const { createOrderInvoicePdf } = require('../utils/orderInvoicePdf');
 const { ownsOrder, customerOrdersFilter } = require('../utils/orderAccess');
 const escapeRegex = require('../utils/escapeRegex');
 const DIGITAL_FREE_SHIPPING_NAME = 'Digital Products — Free Delivery';
+const normalizeInventorySize = (value, unitName = '') => {
+  const size = String(value ?? '').trim().toLowerCase().replace(/\s+/g, '');
+  const unit = String(unitName ?? '').trim().toLowerCase().replace(/\s+/g, '');
+  if (!size || !unit || !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(size) || size.endsWith(unit)) return size;
+  return `${size}${unit}`;
+};
 const {
   getLoyaltyAccount,
   getLoyaltySettings,
@@ -786,32 +792,40 @@ module.exports.createOrder = async (req, res) => {
 
     // Notify via Socket.IO
     notifyOrderUpdate(savedOrder, 'create');
-    
-    // Send immediate order confirmation email
-    try {
-      const user = await User.findById(userId).lean();
-      if (user && user.email) {
-        const emailResult = await sendOrderConfirmation(savedOrder, user);
-        if (emailResult.success) {
-          // Mark email as sent
-          await Order.findByIdAndUpdate(savedOrder._id, {
-            $set: { emailSent: 'confirmation' }
-          });
-          console.log(`✅ Immediate confirmation email sent for order #${savedOrder.orderId}`);
-        } else {
-          console.log(`⚠️ Failed to send immediate confirmation email for order #${savedOrder.orderId}: ${emailResult.message}`);
+
+    // The order is committed and the cart is cleared at this point. Return it
+    // immediately so a slow SMTP provider cannot leave checkout spinning after
+    // the purchase has already succeeded. Email delivery runs after the response.
+    res.status(201).json(savedOrder);
+
+    setImmediate(() => {
+      void (async () => {
+        try {
+          if (!user?.email) return;
+
+          const emailResult = await sendOrderConfirmation(savedOrder, user);
+          if (emailResult.success) {
+            await Order.findByIdAndUpdate(savedOrder._id, {
+              $set: { emailSent: 'confirmation' },
+            });
+            console.log(`✅ Immediate confirmation email sent for order #${savedOrder.orderId}`);
+          } else {
+            console.warn(`⚠️ Confirmation email was not sent for order #${savedOrder.orderId}: ${emailResult.message}`);
+          }
+
+          if (savedOrder.paymentStatus === 'completed' && savedOrder.items.some((item) => item.isDigitalProduct)) {
+            const digitalResult = await sendOrderDigitalCodes(savedOrder, user);
+            if (!digitalResult.success) {
+              console.error(`Digital fulfillment email was not sent for order #${savedOrder.orderId}: ${digitalResult.message}`);
+            }
+          }
+        } catch (emailError) {
+          console.error(`❌ Background order email failed for #${savedOrder.orderId}:`, emailError.message);
         }
-        if (savedOrder.paymentStatus === 'completed' && savedOrder.items.some((item) => item.isDigitalProduct)) {
-          const digitalResult = await sendOrderDigitalCodes(savedOrder, user);
-          if (!digitalResult.success) console.error(`Digital fulfillment email was not sent for order #${savedOrder.orderId}: ${digitalResult.message}`);
-        }
-      }
-    } catch (emailError) {
-      console.error(`❌ Error sending immediate confirmation email for order #${savedOrder.orderId}:`, emailError.message);
-      // Don't fail the order creation if email fails
-    }
-    
-    return res.status(201).json(savedOrder);
+      })();
+    });
+
+    return;
   } catch (err) {
     if (session.inTransaction()) {
       await session.abortTransaction();
@@ -2078,9 +2092,14 @@ module.exports.assignInventoryToOrderItem = async (req, res) => {
 
     // Validate that inventory matches the order item requirements
     const orderItem = order.items[orderItemIndex];
+    const product = await Product.findById(orderItem.productId).session(session);
+    const productVariant = product?.variants?.id(orderItem.variantId);
+    const expectedUnitName = orderItem.unitName || orderItem.configuration?.unitName || productVariant?.unitName || '';
+    const inventorySize = normalizeInventorySize(inventoryItem.size, expectedUnitName);
+    const expectedSize = normalizeInventorySize(orderItem.size, expectedUnitName);
     if (inventoryItem.productId.toString() !== orderItem.productId.toString() ||
         inventoryItem.variantId.toString() !== orderItem.variantId.toString() ||
-        inventoryItem.size !== orderItem.size) {
+        inventorySize !== expectedSize) {
       await session.abortTransaction();
       return res.status(400).json({ 
         success: false,
@@ -2114,7 +2133,6 @@ module.exports.assignInventoryToOrderItem = async (req, res) => {
     await inventoryItem.save({ session });
 
     // Update product variant stock
-    const product = await Product.findById(orderItem.productId).session(session);
     if (product) {
       const variant = product.variants.id(orderItem.variantId);
       if (variant) {

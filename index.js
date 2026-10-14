@@ -435,17 +435,26 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('sendMessage', async (message) => {
+  socket.on('sendMessage', async (message, acknowledge) => {
+    const ack = (result) => {
+      if (typeof acknowledge === 'function') {
+        try { acknowledge(result); } catch {}
+      }
+    };
     const { roomId, text, image, tempId } = message || {};
+    const clientMessageId = typeof tempId === 'string' ? tempId.slice(0, 128) : '';
     const senderId = socket.data?.userId;
     const senderType = socket.data?.userType;
     const hasText = typeof text === 'string' && text.trim().length > 0;
     const hasImage = typeof image === 'string' && image.trim().length > 0;
     if (!socket.data?.isAuthenticated || !['admin', 'customer'].includes(senderType) || !roomId || !senderId || (!hasText && !hasImage)) {
+      ack({ success: false, error: 'Message could not be sent. Please reconnect and try again.' });
       return;
     }
     if (!allowChatMutation(socket) || (hasText && text.length > 5000) || (hasImage && !isSafeChatImage(image))) {
-      socket.emit('messageError', { error: 'Message is too large or contains an unsupported image URL' });
+      const error = 'Message is too large or contains an unsupported image URL';
+      socket.emit('messageError', { error, tempId: clientMessageId });
+      ack({ success: false, error });
       return;
     }
     
@@ -462,13 +471,29 @@ io.on('connection', (socket) => {
         try {
           room = await ChatRoom.findById(roomId);
           if (!room) {
+            ack({ success: false, error: 'Chat room not found.' });
             return;
           }
 
-          if (!socketOwnsChatRoom(socket, room)) return;
+          if (!socketOwnsChatRoom(socket, room)) {
+            ack({ success: false, error: 'You do not have access to this chat.' });
+            return;
+          }
           
           if (room.isClosed) {
+            ack({ success: false, error: 'This chat is closed.' });
             return;
+          }
+
+          // A retry with the same client id returns the already saved message.
+          // The check is repeated after version-conflict retries, so concurrent
+          // emissions cannot persist the same client operation twice.
+          const previousMessage = clientMessageId
+            ? room.messages.find((item) => item.clientMessageId === clientMessageId)
+            : null;
+          if (previousMessage) {
+            savedMessage = previousMessage;
+            break;
           }
           
           // Create message with proper structure and explicit _id
@@ -481,6 +506,7 @@ io.on('connection', (socket) => {
             image: hasImage ? image : '',
             reaction: "",
             reactions: [],
+            clientMessageId,
             readBy: [{
               readerType: senderType,
               readerId: senderId,
@@ -515,26 +541,32 @@ io.on('connection', (socket) => {
         const messageData = { ...savedMessage.toObject(), roomId };
         
         // Emit to all users in the room
-        io.to(`chat_${roomId}`).emit('messageReceived', messageData);
-        io.to('adminRoom').emit('messageReceived', messageData);
+        // A room can include an admin who is also in adminRoom. Chaining room
+        // targets emits once per socket instead of once per room membership.
+        io.to(`chat_${roomId}`).to('adminRoom').emit('messageReceived', messageData);
         
         // Emit message confirmation for temporary messages (echo the sender's tempId back)
         io.to(`chat_${roomId}`).emit('messageConfirmed', {
-          tempId: tempId || `temp_${Date.now()}`,
+          tempId: clientMessageId || tempId || `temp_${Date.now()}`,
           realId: savedMessage._id,
           updates: {
             _id: savedMessage._id,
             readBy: savedMessage.readBy
           }
         });
+
+        ack({ success: true, tempId: clientMessageId, messageId: String(savedMessage._id) });
         
         console.log(`✉️ Message saved and sent to chat_${roomId} by ${senderId} (${senderType})`);
+      } else {
+        ack({ success: false, error: 'Message could not be saved. Please try again.' });
       }
       
     } catch (error) {
       console.error('❌ Error saving message:', error);
       // Emit error back to sender
-      socket.emit('messageError', { error: 'Failed to save message' });
+      socket.emit('messageError', { error: 'Failed to save message', tempId: clientMessageId });
+      ack({ success: false, error: 'Failed to save message.' });
     }
   });
 

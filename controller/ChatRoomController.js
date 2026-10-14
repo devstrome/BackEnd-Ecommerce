@@ -84,9 +84,16 @@ exports.sendMessage = async (req, res) => {
       throw new BadRequestError('Cannot send message to closed chat room');
     }
 
+    const clientMessageId = typeof tempId === 'string' ? tempId.slice(0, 128) : '';
+    const existingMessage = clientMessageId
+      ? room.messages.find((message) => message.clientMessageId === clientMessageId)
+      : null;
+    if (existingMessage) return res.status(200).json(existingMessage);
+
     // Create message with proper structure and explicit _id
     const newMessage = {
       _id: new mongoose.Types.ObjectId(), // Explicitly set _id
+      clientMessageId,
       senderId, 
       senderType, 
       senderName: (req.user?.fullName || [req.user?.firstName, req.user?.lastName].filter(Boolean).join(' ') || req.admin?.fullName || [req.admin?.firstName, req.admin?.lastName].filter(Boolean).join(' ') || (senderType === 'admin' ? 'BELORELLA Support' : 'Customer')).trim(),
@@ -113,8 +120,7 @@ exports.sendMessage = async (req, res) => {
     if (io) {
       // Use toObject() to ensure proper serialization
       const messageData = { ...savedMessage.toObject(), roomId };
-      io.to(`chat_${roomId}`).emit("messageReceived", messageData);
-      io.to('adminRoom').emit("messageReceived", messageData);
+      io.to(`chat_${roomId}`).to('adminRoom').emit("messageReceived", messageData);
       
       // Emit message confirmation for temporary messages
       io.to(`chat_${roomId}`).emit("messageConfirmed", {

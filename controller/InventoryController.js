@@ -143,7 +143,18 @@ exports.getAllInventory = catchAsyncErrors(async (req, res, next) => {
   }
 
   if (size) {
-    query.size = size;
+    const normalizedSize = String(size).trim();
+    const numericSize = normalizedSize.match(/^(\d+(?:\.\d+)?)(?:\s*([a-zA-Z%]+))?$/);
+    if (numericSize) {
+      const [, numericValue, unit] = numericSize;
+      const unitPattern = unit ? `\\s*${escapeRegex(unit)}` : '\\s*[a-zA-Z%]*';
+      // Product variants commonly store catalog sizes like "100", while
+      // inventory rows store the display size with its unit (for example,
+      // "100ml"). Match the same numeric size without matching 1000.
+      query.size = { $regex: `^${escapeRegex(numericValue)}${unitPattern}$`, $options: 'i' };
+    } else {
+      query.size = { $regex: `^${escapeRegex(normalizedSize)}$`, $options: 'i' };
+    }
   }
 
   if (color) {

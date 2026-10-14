@@ -49,6 +49,12 @@ const MessageSchema = new mongoose.Schema({
     type: String,
     default: ""
   },
+  // Client generated id makes socket retries idempotent across transient disconnects.
+  clientMessageId: {
+    type: String,
+    default: "",
+    maxlength: 128
+  },
   senderName: {
     type: String,
     default: ""
