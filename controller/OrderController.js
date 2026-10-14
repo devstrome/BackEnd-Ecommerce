@@ -63,6 +63,119 @@ const reverseOrderLoyalty = async (order, session = null) => {
   }
 };
 
+const sameStockLabel = (left, right) => String(left ?? '').trim().toLowerCase() === String(right ?? '').trim().toLowerCase();
+
+// Digital goods don't consume barcode/QR inventory rows. Commit catalog stock
+// only once the order is both paid and delivered, using the order's selected
+// variant/size. The per-line marker keeps retries and repeated updates safe.
+async function deductDigitalCatalogStock(order, session) {
+  const products = new Map();
+  const stockEvents = [];
+
+  for (const item of order.items || []) {
+    if (item.digitalStockDeducted) continue;
+    const productId = String(item.productId?._id || item.productId || '');
+    if (!mongoose.isValidObjectId(productId)) continue;
+
+    let product = products.get(productId);
+    if (!product) {
+      product = await Product.findById(productId).session(session);
+      if (product) products.set(productId, product);
+    }
+    if (!product) continue;
+    if (!item.isDigitalProduct && !product.isDigitalProduct) continue;
+    item.isDigitalProduct = true;
+
+    const variantId = String(item.variantId?._id || item.variantId || '');
+    const configuration = item.configuration || {};
+    const variantColor = configuration.color || item.color || '';
+    const variantRegionId = item.regionId?._id || item.regionId || configuration.regionId?._id || configuration.regionId;
+    let variant = product.variants?.id(variantId);
+    if (!variant) {
+      const candidates = (product.variants || []).filter((candidate) =>
+        (!variantColor || sameStockLabel(candidate.colorName, variantColor)) &&
+        (!variantRegionId || !candidate.regionId || String(candidate.regionId) === String(variantRegionId))
+      );
+      if (candidates.length === 1) variant = candidates[0];
+      else if ((product.variants || []).length === 1) variant = product.variants[0];
+    }
+
+    const quantity = Math.max(1, Math.floor(Number(item.quantity) || 1));
+    const size = configuration.size || item.size || '';
+    const measureType = configuration.measureType || item.measureType || '';
+    const unitName = configuration.unitName || item.unitName || '';
+
+    if (!variant) {
+      console.warn(`Digital stock could not be matched to a product variant for product ${productId}`);
+      // Do not block an already delivered order if its catalog variant was
+      // removed; this line is still considered committed to avoid double work.
+      item.digitalStockDeducted = true;
+      continue;
+    }
+
+    const option = (variant.options || []).find((entry) =>
+      sameStockLabel(entry.size, size) &&
+      sameStockLabel(entry.measureType, measureType) &&
+      sameStockLabel(entry.unitName, unitName)
+    );
+    const sizeIndex = (variant.sizes || []).findIndex((candidate) => sameStockLabel(candidate, size));
+    let newStock;
+
+    if (option) {
+      option.stock = Math.max(0, Number(option.stock || 0) - quantity);
+      // Maintain populated legacy size counts too, when they are present.
+      if (sizeIndex !== -1 && Number(variant.stockBySize?.[sizeIndex]) > 0) {
+        variant.stockBySize[sizeIndex] = Math.max(0, Number(variant.stockBySize[sizeIndex]) - quantity);
+      }
+      variant.stock = (variant.options || []).reduce((sum, entry) => sum + Number(entry.stock || 0), 0);
+      newStock = option.stock;
+    } else if (sizeIndex !== -1 && Array.isArray(variant.stockBySize) && variant.stockBySize.length > sizeIndex) {
+      variant.stockBySize[sizeIndex] = Math.max(0, Number(variant.stockBySize[sizeIndex] || 0) - quantity);
+      variant.stock = variant.stockBySize.reduce((sum, count) => sum + Number(count || 0), 0);
+      newStock = variant.stockBySize[sizeIndex];
+    } else if (!(variant.options || []).length && variant.stock !== undefined && variant.stock !== null) {
+      variant.stock = Math.max(0, Number(variant.stock || 0) - quantity);
+      newStock = variant.stock;
+    } else if ((variant.options || []).length === 1) {
+      const onlyOption = variant.options[0];
+      onlyOption.stock = Math.max(0, Number(onlyOption.stock || 0) - quantity);
+      variant.stock = onlyOption.stock;
+      newStock = onlyOption.stock;
+    } else {
+      console.warn(`Digital stock option could not be matched for product ${productId}, variant ${variantId}, size ${size || '(none)'}`);
+      item.digitalStockDeducted = true;
+      continue;
+    }
+
+    item.digitalStockDeducted = true;
+    stockEvents.push({
+      productId: product._id,
+      variantId: variant._id,
+      size,
+      newStock,
+      action: 'decrease',
+    });
+  }
+
+  for (const product of products.values()) {
+    if ((order.items || []).some((item) => String(item.productId?._id || item.productId) === String(product._id) && item.digitalStockDeducted)) {
+      await product.save({ session });
+    }
+  }
+  return stockEvents;
+}
+
+function publishDigitalStockUpdates(stockEvents = []) {
+  if (!stockEvents.length) return;
+  for (const event of stockEvents) {
+    if (ioInstance) ioInstance.to('adminRoom').emit('stockUpdate', event);
+  }
+  const productIds = [...new Set(stockEvents.map((event) => String(event.productId)))];
+  require('./CartController').revalidateCarts({ productIds }).catch((error) => {
+    console.warn('Could not refresh carts after digital stock deduction:', error.message);
+  });
+}
+
 // Socket.io instance (set from server.js)
 let ioInstance = null;
 
@@ -982,12 +1095,16 @@ module.exports.adminCreateOrder = async (req, res) => {
 
     const orderSession = await mongoose.startSession();
     let savedOrder;
+    let digitalStockUpdates = [];
     try {
       orderSession.startTransaction();
       savedOrder = await newOrder.save({ session: orderSession });
       await reserveDigitalCodesForOrder(savedOrder, orderSession);
       if (savedOrder.paymentStatus === 'completed') {
         savedOrder.loyaltyRewardEarned = await earnOrderReward(savedOrder, orderSession);
+      }
+      if (savedOrder.orderStatus === 'delivered' && savedOrder.paymentStatus === 'completed') {
+        digitalStockUpdates = await deductDigitalCatalogStock(savedOrder, orderSession);
       }
       savedOrder = await savedOrder.save({ session: orderSession });
       await orderSession.commitTransaction();
@@ -997,6 +1114,7 @@ module.exports.adminCreateOrder = async (req, res) => {
     } finally {
       await orderSession.endSession();
     }
+    publishDigitalStockUpdates(digitalStockUpdates);
     notifyOrderUpdate(savedOrder, 'create');
 
     // Send order confirmation email (never fail order creation if email fails)
@@ -1241,6 +1359,7 @@ module.exports.updateOrderStatus = async (req, res) => {
     let updatedOrder;
     let statusChanged = false;
     let paymentStatusChanged = false;
+    let digitalStockUpdates = [];
     await session.withTransaction(async () => {
       const existingOrder = await Order.findById(orderId).session(session);
       if (!existingOrder) {
@@ -1250,7 +1369,12 @@ module.exports.updateOrderStatus = async (req, res) => {
       }
       statusChanged = Object.entries(update).some(([field, value]) => existingOrder[field] !== value);
       paymentStatusChanged = Object.prototype.hasOwnProperty.call(update, 'paymentStatus') && existingOrder.paymentStatus !== update.paymentStatus;
+      const wasDigitalStockEligible = existingOrder.orderStatus === 'delivered' && existingOrder.paymentStatus === 'completed';
       existingOrder.set(update);
+      const isDigitalStockEligible = existingOrder.orderStatus === 'delivered' && existingOrder.paymentStatus === 'completed';
+      if (!wasDigitalStockEligible && isDigitalStockEligible) {
+        digitalStockUpdates = await deductDigitalCatalogStock(existingOrder, session);
+      }
 
       if (existingOrder.paymentStatus === 'completed') {
         existingOrder.loyaltyRewardEarned = await earnOrderReward(existingOrder, session);
@@ -1265,6 +1389,7 @@ module.exports.updateOrderStatus = async (req, res) => {
     
     // Notify via Socket.IO
     notifyOrderUpdate(updatedOrder, 'update');
+    publishDigitalStockUpdates(digitalStockUpdates);
     
     // Send status-specific emails
     try {
@@ -1794,6 +1919,7 @@ module.exports.processRefundRequest = async (req, res) => {
 module.exports.adminUpdateOrder = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
+  let digitalStockUpdates = [];
 
   try {
     const { orderId } = req.params;
@@ -1811,6 +1937,7 @@ module.exports.adminUpdateOrder = async (req, res) => {
       await session.abortTransaction();
       return res.status(404).json({ message: 'Order not found' });
     }
+    const wasDigitalStockEligible = order.orderStatus === 'delivered' && order.paymentStatus === 'completed';
 
     const payload = req.body || {};
 
@@ -1865,6 +1992,13 @@ module.exports.adminUpdateOrder = async (req, res) => {
       await releaseDigitalCodesForOrder(order, session);
       order.items = payload.items.map((item, index) => {
         const snapshot = hydratedItems[index] || item;
+        const previousItem = order.items.find((current) =>
+          (item._id && String(current._id) === String(item._id)) || (
+            String(current.productId?._id || current.productId) === String(item.productId?._id || item.productId) &&
+            String(current.variantId?._id || current.variantId) === String(item.variantId?._id || item.variantId) &&
+            sameStockLabel(current.size || current.configuration?.size, item.size || item.configuration?.size)
+          )
+        );
         return {
           variantId: item.variantId,
           productId: item.productId,
@@ -1890,6 +2024,8 @@ module.exports.adminUpdateOrder = async (req, res) => {
           color: item.color,
           measureType: item.measureType,
           unitName: item.unitName,
+          isDigitalProduct: Boolean(snapshot.isDigitalProduct || item.isDigitalProduct),
+          digitalStockDeducted: Boolean(item.digitalStockDeducted || previousItem?.digitalStockDeducted),
           configuration: {
             regionId: item.regionId || null,
             regionName: item.regionName || '',
@@ -2005,8 +2141,14 @@ module.exports.adminUpdateOrder = async (req, res) => {
       await releaseDigitalCodesForOrder(order, session);
     }
 
+    const isDigitalStockEligible = order.orderStatus === 'delivered' && order.paymentStatus === 'completed';
+    if (!wasDigitalStockEligible && isDigitalStockEligible) {
+      digitalStockUpdates = await deductDigitalCatalogStock(order, session);
+    }
+
     const updatedOrder = await order.save({ session });
     await session.commitTransaction();
+    publishDigitalStockUpdates(digitalStockUpdates);
 
     if (updatedOrder.paymentStatus === 'completed' && updatedOrder.items.some((item) => item.isDigitalProduct)) {
       try {
@@ -2073,6 +2215,16 @@ module.exports.assignInventoryToOrderItem = async (req, res) => {
       });
     }
 
+    const orderItem = order.items[orderItemIndex];
+    const product = await Product.findById(orderItem.productId).session(session);
+    if (orderItem.isDigitalProduct || product?.isDigitalProduct) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        success: false,
+        message: 'Digital products do not use barcode or QR inventory assignment. Stock is deducted when the order is paid and delivered.',
+      });
+    }
+
     // Find the inventory item
     const inventoryItem = await Inventory.findById(inventoryId).session(session);
     if (!inventoryItem) {
@@ -2093,8 +2245,6 @@ module.exports.assignInventoryToOrderItem = async (req, res) => {
     }
 
     // Validate that inventory matches the order item requirements
-    const orderItem = order.items[orderItemIndex];
-    const product = await Product.findById(orderItem.productId).session(session);
     const productVariant = product?.variants?.id(orderItem.variantId);
     const expectedUnitName = orderItem.unitName || orderItem.configuration?.unitName || productVariant?.unitName || '';
     const inventorySize = normalizeInventorySize(inventoryItem.size, expectedUnitName);

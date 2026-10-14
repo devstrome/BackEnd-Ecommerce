@@ -2,13 +2,18 @@ const nodemailer = require('nodemailer');
 const { BRAND, brandFrom, brandFooter, publicSiteUrl } = require('./brand');
 const { formatMeasureParts, formatMeasureText } = require('./measure');
 
-// Email configuration
+// Render's free web services block SMTP ports 25, 465, and 587. Prefer the
+// HTTPS Resend API when configured, while keeping SMTP available for local or
+// paid hosting environments.
 const transporter = nodemailer.createTransport({
   service: process.env.EMAIL_SERVICE || 'gmail',
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASSWORD
-  }
+  },
+  connectionTimeout: 10000,
+  greetingTimeout: 10000,
+  socketTimeout: 20000,
 });
 
 const addBrandLogoToEmailHtml = (html) => {
@@ -34,11 +39,72 @@ const replaceLocalStorefrontUrls = (content) => {
   );
 };
 
-const sendBrandedEmail = (mailOptions) => transporter.sendMail({
-  ...mailOptions,
-  html: addBrandLogoToEmailHtml(replaceLocalStorefrontUrls(mailOptions.html)),
-  text: replaceLocalStorefrontUrls(mailOptions.text),
-});
+const sendEmailWithResend = async (mailOptions) => {
+  const from = String(process.env.RESEND_FROM_EMAIL || '').trim();
+  if (!from) {
+    throw new Error('RESEND_FROM_EMAIL is required when RESEND_API_KEY is configured. Use an address from a verified sending domain.');
+  }
+
+  const payload = {
+    from,
+    to: mailOptions.to,
+    subject: mailOptions.subject,
+    html: addBrandLogoToEmailHtml(replaceLocalStorefrontUrls(mailOptions.html)),
+    text: replaceLocalStorefrontUrls(mailOptions.text),
+  };
+  if (mailOptions.cc) payload.cc = mailOptions.cc;
+  if (mailOptions.bcc) payload.bcc = mailOptions.bcc;
+  if (mailOptions.replyTo) payload.reply_to = mailOptions.replyTo;
+  if (mailOptions.attachments?.length) {
+    payload.attachments = mailOptions.attachments.map((attachment) => {
+      const converted = { filename: attachment.filename || 'attachment' };
+      if (attachment.content !== undefined) {
+        const content = attachment.content;
+        converted.content = Buffer.isBuffer(content)
+          ? content.toString('base64')
+          : Buffer.from(String(content)).toString('base64');
+      } else if (attachment.path) {
+        converted.path = attachment.path;
+      }
+      if (attachment.contentType || attachment.content_type) {
+        converted.content_type = attachment.contentType || attachment.content_type;
+      }
+      return converted;
+    });
+  }
+
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(15000),
+  });
+  const responseText = await response.text();
+  let responseBody = {};
+  try { responseBody = responseText ? JSON.parse(responseText) : {}; } catch { /* keep provider response text out of normal success flow */ }
+  if (!response.ok) {
+    const providerMessage = responseBody.message || responseBody.error || `HTTP ${response.status}`;
+    throw new Error(`Resend email request failed: ${providerMessage}`);
+  }
+  return { messageId: responseBody.id };
+};
+
+const sendBrandedEmail = (mailOptions) => {
+  if (process.env.RESEND_API_KEY) return sendEmailWithResend(mailOptions);
+  return transporter.sendMail({
+    ...mailOptions,
+    html: addBrandLogoToEmailHtml(replaceLocalStorefrontUrls(mailOptions.html)),
+    text: replaceLocalStorefrontUrls(mailOptions.text),
+  }).catch((error) => {
+    if (/ETIMEDOUT|ECONNECTION|ESOCKET|timeout/i.test(`${error.code || ''} ${error.message || ''}`)) {
+      error.message = `${error.message || 'SMTP connection failed'}. If this backend is on Render Free, configure RESEND_API_KEY and RESEND_FROM_EMAIL because outbound SMTP is blocked.`;
+    }
+    throw error;
+  });
+};
 
 // Superadmins receive a hidden copy of operational notifications. Resolve the
 // recipients at send time so newly-created or banned admins are respected.

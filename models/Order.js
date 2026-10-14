@@ -37,6 +37,9 @@ const orderItemSchema = new mongoose.Schema({
   unitName: { type: String },
   isPreOrder: { type: Boolean, default: false },
   isDigitalProduct: { type: Boolean, default: false },
+  // Catalog stock is reduced once when a digital line is both paid and
+  // delivered. This also makes retries and repeated status updates safe.
+  digitalStockDeducted: { type: Boolean, default: false },
   digitalCodeIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'DigitalProductCode' }],
   // Manual digital credentials are encrypted at rest and only returned through
   // authenticated order fulfillment/customer-owner endpoints.
