@@ -17,8 +17,10 @@ const isForwardStep = (from, to) =>
   !(from && RANK[to] != null && RANK[from] != null && RANK[to] < RANK[from]);
 
 const normPhone = (p) => {
-  const digits = String(p || '').replace(/\D/g, '');
-  if (digits.startsWith('880')) return '0' + digits.slice(3);
+  let digits = String(p || '').replace(/\D/g, '');
+  if (digits.startsWith('00880')) digits = '0' + digits.slice(5);
+  else if (digits.startsWith('880')) digits = '0' + digits.slice(3);
+  else if (/^1\d{9}$/.test(digits)) digits = `0${digits}`;
   return digits;
 };
 
@@ -88,7 +90,19 @@ function providerError(err, provider) {
   // so data.message would be undefined and the real reason would be lost.
   let apiMessage;
   if (typeof data === 'string') apiMessage = data;
-  else apiMessage = data?.message || data?.error || data?.errors;
+  else {
+    const message = data?.message || data?.error;
+    const validation = data?.errors || data?.validation || data?.details;
+    const validationText = validation && typeof validation === 'object'
+      ? Object.entries(validation).map(([field, value]) => {
+        const messages = Array.isArray(value) ? value : [value];
+        return `${field}: ${messages.map((entry) => typeof entry === 'string' ? entry : JSON.stringify(entry)).join(', ')}`;
+      }).join('; ')
+      : (validation == null ? '' : String(validation));
+    apiMessage = [message, validationText && `Validation details — ${validationText}`]
+      .filter(Boolean)
+      .join('. ');
+  }
   if (apiMessage == null || apiMessage === '') apiMessage = err.message;
   const detail = typeof apiMessage === 'string' ? apiMessage : JSON.stringify(apiMessage);
   const e = new Error(`${provider} API error: ${detail}`);
@@ -101,6 +115,24 @@ async function pathaoCreateShipment(order) {
   const phone = normPhone(addr.phone);
   const items = shippableItems(order);
   if (!items.length) throw new Error('Digital-only orders do not require courier delivery');
+
+  // Pathao accepts a single address string and tries to resolve the delivery
+  // area from it. Include the checkout's city, postal code, and country instead
+  // of sending only the street field.
+  const addressParts = [addr.address || addr.street, addr.city, addr.state, addr.postalCode, addr.country]
+    .map((part) => String(part || '').trim())
+    .filter(Boolean)
+    .filter((part, index, all) => all.findIndex((candidate) => candidate.toLowerCase() === part.toLowerCase()) === index);
+  const recipientAddress = addressParts.join(', ').slice(0, 220);
+  const recipientName = String(addr.fullName || 'Customer').trim().slice(0, 100);
+  const weight = Number(process.env.PATHAO_DEFAULT_WEIGHT) || 0.5;
+
+  const validationErrors = [];
+  if (!/^01[3-9]\d{8}$/.test(phone)) validationErrors.push('Recipient phone must be a valid 11-digit Bangladesh mobile number (01XXXXXXXXX).');
+  if (recipientName.length < 3) validationErrors.push('Recipient name must contain at least 3 characters.');
+  if (recipientAddress.length < 10) validationErrors.push('Recipient address must include a detailed street address and city (at least 10 characters).');
+  if (weight < 0.5 || weight > 10) validationErrors.push('PATHAO_DEFAULT_WEIGHT must be between 0.5 and 10 kg.');
+  if (validationErrors.length) throw new Error(`Pathao validation error: ${validationErrors.join(' ')}`);
 
   // store_id is REQUIRED (sets the pickup location). Use PATHAO_STORE_ID or
   // resolve the merchant's default/first active store automatically.
@@ -118,20 +150,18 @@ async function pathaoCreateShipment(order) {
     store_id: storeId,
     merchant_order_id: order.orderId || String(order._id),
     sender_phone: senderPhone(),
-    recipient_name: (addr.fullName || 'Customer').slice(0, 100),
+    recipient_name: recipientName,
     recipient_phone: phone,
-    recipient_address: (addr.address || addr.street || 'N/A').slice(0, 220),
+    recipient_address: recipientAddress,
     delivery_type: Number(process.env.PATHAO_DELIVERY_TYPE) || 48, // 48 normal / 12 on-demand
     item_type: 2, // 1 document / 2 parcel
     item_quantity: Math.max(1, items.reduce((n, i) => n + (Number(i.quantity) || 1), 0)),
-    item_weight: Number(process.env.PATHAO_DEFAULT_WEIGHT) || 0.5, // 0.5 - 10 kg
+    item_weight: weight, // 0.5 - 10 kg
     item_description: items.map(i => i.name).filter(Boolean).join(', ').slice(0, 200) || 'Parcel',
     amount_to_collect: Math.round(order.paymentMethod && /cash|cod/i.test(order.paymentMethod)
       ? items.reduce((sum, item) => sum + (Number(item.price) || 0) * (Number(item.quantity) || 0), 0) : 0),
     special_instruction: order.note || undefined,
   };
-  if (addr.email) payload.recipient_secondary_phone = undefined;
-
   try {
     const res = await pathaoRequest('POST', '/aladdin/api/v1/orders', payload);
     const data = res.data?.data || {};
