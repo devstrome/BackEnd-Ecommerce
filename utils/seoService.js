@@ -42,21 +42,76 @@ function uniqueText(values, limit = Infinity) {
 function getVariantOptions(variant = {}) {
   if (Array.isArray(variant.options) && variant.options.length) return variant.options;
   const sizes = Array.isArray(variant.sizes) ? variant.sizes : [];
-  return sizes.map((size, index) => ({
-    size,
+  const prices = Array.isArray(variant.prices) ? variant.prices : [];
+  const discounts = Array.isArray(variant.discountPrices) ? variant.discountPrices : [];
+  return Array.from({ length: Math.max(sizes.length, prices.length, discounts.length) }, (_, index) => ({
+    size: sizes[index] || '',
     measureType: variant.measureType || '',
     unitName: variant.unitName || '',
-    price: variant.prices?.[index],
-    discountPrice: variant.discountPrices?.[index],
+    price: prices[index],
+    discountPrice: discounts[index],
   }));
 }
 
 function getOptionLabels(variant = {}) {
   return uniqueText(getVariantOptions(variant).map((option) => {
     const size = cleanText(option.size);
-    if (size) return size;
-    return [option.measureType, option.unitName].map(cleanText).filter(Boolean).join(' ');
+    const measureType = cleanText(option.measureType || variant.measureType);
+    const unitName = cleanText(option.unitName || variant.unitName);
+    const measuredSize = size
+      ? size + (unitName && !size.toLocaleLowerCase().includes(unitName.toLocaleLowerCase()) ? ' ' + unitName : '')
+      : unitName;
+    return [measureType, measuredSize].filter(Boolean).join(': ');
   }));
+}
+
+function getOptionPriceRows(variant = {}) {
+  return getVariantOptions(variant).map((option) => {
+    const base = Number(option.price);
+    const discount = Number(option.discountPrice);
+    const price = discount > 0 && discount < base ? discount : base;
+    if (!Number.isFinite(price) || price <= 0) return null;
+
+    const size = cleanText(option.size);
+    const unitName = cleanText(option.unitName || variant.unitName);
+    const measureType = cleanText(option.measureType || variant.measureType);
+    const measuredSize = size
+      ? size + (unitName && !size.toLocaleLowerCase().includes(unitName.toLocaleLowerCase()) ? ' ' + unitName : '')
+      : unitName;
+    const label = [measureType, measuredSize].filter(Boolean).join(': ') || 'Standard';
+    return { label, price };
+  }).filter(Boolean);
+}
+
+function formatPrice(price) {
+  return 'BDT ' + new Intl.NumberFormat('en-BD', { maximumFractionDigits: 2 }).format(price);
+}
+
+function getProductPriceGroups(product, selectedVariant = null) {
+  const variants = selectedVariant
+    ? [selectedVariant]
+    : (Array.isArray(product.variants) ? product.variants : []);
+  const groups = variants.map((variant) => {
+    const options = getOptionPriceRows(variant);
+    if (!options.length) return null;
+    const label = uniqueText([variant.colorName, variant.regionName], 2).join(' · ');
+    return { label, options };
+  }).filter(Boolean);
+
+  if (!groups.length && !selectedVariant) {
+    const base = Number(product.discountPrice) > 0 && Number(product.discountPrice) < Number(product.mainPrice)
+      ? Number(product.discountPrice)
+      : Number(product.mainPrice);
+    if (Number.isFinite(base) && base > 0) groups.push({ label: '', options: [{ label: 'Standard', price: base }] });
+  }
+  return groups;
+}
+
+function formatPriceDetails(groups) {
+  return (groups || []).map(({ label, options }) => {
+    const prices = options.map(({ label: optionLabel, price }) => optionLabel + ' ' + formatPrice(price));
+    return (label ? label + ': ' : '') + prices.join(', ');
+  }).filter(Boolean);
 }
 
 async function withRegionNames(product) {
@@ -118,6 +173,8 @@ function makeMetaTitle(product, variant = null) {
   if (variant?.colorName) parts.push(cleanText(variant.colorName));
   const region = cleanText(variant?.regionName || product.regionName);
   if (region) parts.push(region);
+  const optionLabel = variant ? getOptionLabels(variant)[0] : '';
+  if (optionLabel) parts.push(optionLabel);
   const suffix = ' | ' + BRAND;
   return fitText(parts.filter(Boolean).join(' — '), MAX_TITLE_LENGTH - suffix.length) + suffix;
 }
@@ -125,23 +182,31 @@ function makeMetaTitle(product, variant = null) {
 function makeMetaDescription(product, variant = null) {
   const name = productDisplayName(product) || 'Product';
   const description = cleanText(variant?.description || product.description);
-  const base = description
+  const descriptionBase = description
     ? (description.toLocaleLowerCase().includes(name.toLocaleLowerCase()) ? description : name + '. ' + description)
     : 'Shop ' + name + ' at ' + BRAND + '.';
   const details = [];
 
-  if (variant?.colorName) details.push('Color: ' + cleanText(variant.colorName) + '.');
-  const options = variant ? getOptionLabels(variant) : [];
-  if (options.length) details.push('Options: ' + options.slice(0, 4).join(', ') + '.');
+  const priceDetails = formatPriceDetails(getProductPriceGroups(product, variant));
+  if (priceDetails.length) details.push(priceDetails.join('. ') + '.');
+  const measurementTypes = variant
+    ? uniqueText([variant.measureType, ...getVariantOptions(variant).map((option) => option.measureType)], 3)
+    : uniqueText((Array.isArray(product.variants) ? product.variants : []).flatMap((item) => [item.measureType, ...getVariantOptions(item).map((option) => option.measureType)]), 3);
+  if (measurementTypes.length) details.push('Measurement: ' + measurementTypes.join(', ') + '.');
   const categories = Array.isArray(product.categories) ? uniqueText(product.categories.flat(Infinity), 3) : [];
   if (categories.length) details.push('Category: ' + categories.join(' > ') + '.');
   const regions = variant?.regionName
     ? [cleanText(variant.regionName)]
     : uniqueText(product.regionNames || [product.regionName], 4);
   if (regions.length) details.push('Available in ' + regions.join(', ') + '.');
-  if (!base.toLocaleLowerCase().includes(BRAND.toLocaleLowerCase())) details.push('Shop ' + BRAND + ' Bangladesh.');
+  if (!descriptionBase.toLocaleLowerCase().includes(BRAND.toLocaleLowerCase())) details.push('Shop ' + BRAND + ' Bangladesh.');
 
-  return fitText([base, ...details].join(' '), MAX_DESCRIPTION_LENGTH);
+  // Put the exact color/region and size-to-price mapping before descriptive
+  // copy so even short search snippets retain the useful product options.
+  const intro = variant
+    ? [name, variant.colorName, variant.regionName].filter(Boolean).join(' — ') + '.'
+    : name + '.';
+  return fitText([intro, ...details, descriptionBase].join(' '), MAX_DESCRIPTION_LENGTH);
 }
 
 function makeKeywords(product, variant = null) {
@@ -149,13 +214,16 @@ function makeKeywords(product, variant = null) {
   const variantRegions = Array.isArray(product.variants) ? product.variants.map((item) => item.regionName) : [];
   const regions = variant?.regionName ? [variant.regionName] : [...(product.regionNames || []), ...variantRegions];
   const variantTerms = variant
-    ? [variant.colorName, ...getOptionLabels(variant)]
-    : (Array.isArray(product.variants) ? product.variants.flatMap((item) => [item.colorName, ...getOptionLabels(item)]) : []);
+    ? [variant.colorName, variant.regionName, ...getOptionLabels(variant)]
+    : (Array.isArray(product.variants) ? product.variants.flatMap((item) => [item.colorName, item.regionName, ...getOptionLabels(item)]) : []);
   return uniqueText([
     product.name,
     product.brand,
     ...categories,
     ...variantTerms,
+    ...((Array.isArray(product.variants) ? product.variants : []).flatMap((variant) =>
+      getVariantOptions(variant).flatMap((option) => [option.measureType, option.unitName])
+    )),
     ...regions,
     product.gender,
     BRAND,
