@@ -1,16 +1,20 @@
 const nodemailer = require('nodemailer');
 const { BRAND, brandFrom, brandFooter, publicSiteUrl } = require('./brand');
 const { formatMeasureParts, formatMeasureText } = require('./measure');
+const { ADMIN_PERMISSION_CODES } = require('../config/adminPermissions');
 
-// Render's free web services block SMTP ports 25, 465, and 587. Prefer the
-// HTTPS Resend API when configured, while keeping SMTP available for local or
-// paid hosting environments.
+// All application mail uses Gmail SMTP. EMAIL_PASSWORD must be a Google App
+// Password; spaces copied from the Google UI are stripped before connecting.
 const transporter = nodemailer.createTransport({
-  service: process.env.EMAIL_SERVICE || 'gmail',
+  host: 'smtp.gmail.com',
+  port: 587,
+  secure: false,
+  requireTLS: true,
   auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD
+    user: String(process.env.EMAIL_USER || '').trim(),
+    pass: String(process.env.EMAIL_PASSWORD || '').replace(/\s+/g, '')
   },
+  tls: { minVersion: 'TLSv1.2' },
   connectionTimeout: 10000,
   greetingTimeout: 10000,
   socketTimeout: 20000,
@@ -39,91 +43,62 @@ const replaceLocalStorefrontUrls = (content) => {
   );
 };
 
-const sendEmailWithResend = async (mailOptions) => {
-  const from = String(process.env.RESEND_FROM_EMAIL || '').trim();
-  if (!from) {
-    throw new Error('RESEND_FROM_EMAIL is required when RESEND_API_KEY is configured. Use an address from a verified sending domain.');
-  }
-
-  const payload = {
-    from,
-    to: mailOptions.to,
-    subject: mailOptions.subject,
-    html: addBrandLogoToEmailHtml(replaceLocalStorefrontUrls(mailOptions.html)),
-    text: replaceLocalStorefrontUrls(mailOptions.text),
-  };
-  if (mailOptions.cc) payload.cc = mailOptions.cc;
-  if (mailOptions.bcc) payload.bcc = mailOptions.bcc;
-  if (mailOptions.replyTo) payload.reply_to = mailOptions.replyTo;
-  if (mailOptions.attachments?.length) {
-    payload.attachments = mailOptions.attachments.map((attachment) => {
-      const converted = { filename: attachment.filename || 'attachment' };
-      if (attachment.content !== undefined) {
-        const content = attachment.content;
-        converted.content = Buffer.isBuffer(content)
-          ? content.toString('base64')
-          : Buffer.from(String(content)).toString('base64');
-      } else if (attachment.path) {
-        converted.path = attachment.path;
-      }
-      if (attachment.contentType || attachment.content_type) {
-        converted.content_type = attachment.contentType || attachment.content_type;
-      }
-      return converted;
-    });
-  }
-
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(15000),
-  });
-  const responseText = await response.text();
-  let responseBody = {};
-  try { responseBody = responseText ? JSON.parse(responseText) : {}; } catch { /* keep provider response text out of normal success flow */ }
-  if (!response.ok) {
-    const providerMessage = responseBody.message || responseBody.error || `HTTP ${response.status}`;
-    throw new Error(`Resend email request failed: ${providerMessage}`);
-  }
-  return { messageId: responseBody.id };
-};
-
 const sendBrandedEmail = (mailOptions) => {
-  if (process.env.RESEND_API_KEY) return sendEmailWithResend(mailOptions);
+  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASSWORD) {
+    return Promise.reject(new Error('Gmail SMTP requires EMAIL_USER and a Google App Password in EMAIL_PASSWORD.'));
+  }
   return transporter.sendMail({
     ...mailOptions,
     html: addBrandLogoToEmailHtml(replaceLocalStorefrontUrls(mailOptions.html)),
     text: replaceLocalStorefrontUrls(mailOptions.text),
   }).catch((error) => {
     if (/ETIMEDOUT|ECONNECTION|ESOCKET|timeout/i.test(`${error.code || ''} ${error.message || ''}`)) {
-      error.message = `${error.message || 'SMTP connection failed'}. If this backend is on Render Free, configure RESEND_API_KEY and RESEND_FROM_EMAIL because outbound SMTP is blocked.`;
+      error.message = `${error.message || 'SMTP connection failed'}. Confirm outbound SMTP on port 587 is allowed and the Gmail App Password is valid.`;
     }
     throw error;
   });
 };
 
-// Superadmins receive a hidden copy of operational notifications. Resolve the
-// recipients at send time so newly-created or banned admins are respected.
-const getSuperAdminEmails = async () => {
+const verifyEmailConnection = async () => {
+  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASSWORD) {
+    throw new Error('Gmail SMTP requires EMAIL_USER and a Google App Password in EMAIL_PASSWORD.');
+  }
+  await transporter.verify();
+  return true;
+};
+
+// Superadmins receive every operational notification. Regular admins receive
+// only notices for sections included in their assigned permissions.
+const normalizeAdminNotificationPermissions = (permission) => {
+  const requested = Array.isArray(permission) ? permission : [permission];
+  return [...new Set(requested
+    .map((value) => String(value || '').trim())
+    .filter((value) => ADMIN_PERMISSION_CODES.includes(value)))];
+};
+
+const getAdminNotificationEmails = async (permission = null) => {
+  const permissions = normalizeAdminNotificationPermissions(permission);
+  const recipientRoles = [{ superAdmin: true }, { role: 'super_admin' }];
+  if (permissions.length) recipientRoles.push({ permissions: { $in: permissions } });
+
   try {
     const Admin = require('../models/Admin');
-    const admins = await Admin.find({ superAdmin: true, banned: { $ne: true } })
+    const admins = await Admin.find({
+      banned: { $ne: true },
+      $or: recipientRoles,
+    })
       .select('email')
       .lean();
     return [...new Set((admins || [])
       .map((admin) => String(admin.email || '').trim().toLowerCase())
       .filter((email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)))];
   } catch (error) {
-    console.error('Unable to load superadmin notification recipients:', error.message);
+    console.error('Unable to load admin notification recipients:', error.message);
     return [];
   }
 };
 
-const addSuperAdminBcc = async (mailOptions, excludedRecipients = []) => {
+const addAdminNotificationBcc = async (mailOptions, excludedRecipients = [], permission = null) => {
   const excluded = new Set(excludedRecipients
     .flatMap((recipient) => String(recipient || '').split(','))
     .map((email) => email.trim().toLowerCase())
@@ -132,20 +107,20 @@ const addSuperAdminBcc = async (mailOptions, excludedRecipients = []) => {
     ? mailOptions.bcc
     : String(mailOptions.bcc || '').split(',');
   const existing = new Set(existingBcc.map((email) => String(email).trim().toLowerCase()).filter(Boolean));
-  const recipients = (await getSuperAdminEmails())
+  const recipients = (await getAdminNotificationEmails(permission))
     .filter((email) => !excluded.has(email) && !existing.has(email));
   if (recipients.length) mailOptions.bcc = [...existingBcc.filter(Boolean), ...recipients];
   return mailOptions;
 };
 
-const sendSuperAdminNotification = async ({ subject, html, text }) => {
+const sendSuperAdminNotification = async ({ subject, html, text, permission = null }) => {
   try {
     if (!process.env.EMAIL_USER || !process.env.EMAIL_PASSWORD) {
       return { success: false, message: 'Email credentials not configured' };
     }
-    const recipients = await getSuperAdminEmails();
+    const recipients = await getAdminNotificationEmails(permission);
     if (!recipients.length) {
-      return { success: false, message: 'No active superadmin email recipients found' };
+      return { success: false, message: 'No active superadmin or area-assigned admin email recipients found' };
     }
     const senderMailbox = String(process.env.EMAIL_USER).trim().toLowerCase();
     const result = await sendBrandedEmail({
@@ -156,12 +131,30 @@ const sendSuperAdminNotification = async ({ subject, html, text }) => {
       html,
       text,
     });
-    return { success: true, messageId: result.messageId };
+    const rejected = (result.rejected || []).map((recipient) => String(recipient));
+    if (rejected.length) {
+      return {
+        success: false,
+        messageId: result.messageId,
+        message: `Email was accepted for some recipients, but ${rejected.length} recipient${rejected.length === 1 ? '' : 's'} were rejected.`,
+        rejectedCount: rejected.length,
+      };
+    }
+    return { success: true, messageId: result.messageId, recipientCount: recipients.length };
   } catch (error) {
-    console.error('Failed to send superadmin notification:', error.message);
+    console.error('Failed to send admin notification:', error.message);
     return { success: false, error: error.message, message: error.message };
   }
 };
+
+const getAdminNotificationRecipientCount = async () => (await getAdminNotificationEmails(ADMIN_PERMISSION_CODES)).length;
+
+const sendAdminEmailTest = async () => sendSuperAdminNotification({
+  permission: ADMIN_PERMISSION_CODES,
+  subject: `[${BRAND.NAME}] Admin email delivery check`,
+  html: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#222"><header style="padding:20px;background:#8F0E2F;color:#fff"><h1 style="font-size:20px;margin:0">${BRAND.NAME} · Admin email check</h1></header><main style="padding:22px;border:1px solid #eee"><p>This message confirms the Gmail SMTP connection can deliver notifications to the configured admin recipients.</p><p style="color:#666;font-size:12px">Sent at ${new Date().toISOString()}.</p></main></div>`,
+  text: `${BRAND.NAME} admin email delivery check. This confirms Gmail SMTP can deliver notifications to the configured admin recipients. Sent at ${new Date().toISOString()}.`,
+});
 
 // Helper function to format currency
 const formatCurrency = (amount) => {
@@ -180,6 +173,8 @@ const sendAdminOrderNotification = async (order, user = {}, event = 'new_order')
     delivered: 'Order delivered',
     cancelled: 'Order cancelled',
     finalized: 'Order finalized',
+    invoice_emailed: 'Order invoice emailed',
+    digital_delivery_sent: 'Digital fulfillment email sent',
     status_updated: 'Order status updated',
     payment_status_updated: 'Payment status updated',
   };
@@ -201,8 +196,24 @@ const sendAdminOrderNotification = async (order, user = {}, event = 'new_order')
   const textItems = (order?.items || []).map((item) => `${item.name || 'Product'} × ${item.quantity} — ${formatCurrency((Number(item.price) || 0) * (Number(item.quantity) || 0))}`).join('\n');
   return sendSuperAdminNotification({
     subject: `[${BRAND.NAME}] ${label} #${orderNumber}`,
+    permission: 'orders',
     html,
     text: `${label} #${orderNumber}\nCustomer: ${user?.fullName || order?.shippingAddress?.fullName || 'Customer'}\nEmail: ${user?.email || 'Not provided'}\nPhone: ${order?.shippingAddress?.phone || 'Not provided'}\nStatus: ${order?.orderStatus || 'pending'}\nPayment: ${order?.paymentMethod || '—'} / ${order?.paymentStatus || 'pending'}\n${textItems}\nAmount due: ${formatCurrency(amountDue)}\n${dashboardUrl}`,
+  });
+};
+
+const sendAdminChatMessageNotification = async ({ roomId, senderName, text, image, guestEmail }) => {
+  const safeName = escapeEmailHtml(senderName || 'Customer');
+  const safeRoomId = escapeEmailHtml(roomId || '');
+  const safeText = escapeEmailHtml(String(text || '').trim().slice(0, 1200));
+  const safeEmail = escapeEmailHtml(guestEmail || 'Not provided');
+  const chatUrl = publicSiteUrl(`/admin/dashboard/inbox/${encodeURIComponent(String(roomId || ''))}`);
+  const messagePreview = safeText || (image ? 'The customer sent an image.' : 'The customer sent a message.');
+  return sendSuperAdminNotification({
+    subject: `[${BRAND.NAME}] New chat message from ${String(senderName || 'Customer').replace(/[\r\n]/g, ' ').slice(0, 80)}`,
+    permission: 'inbox',
+    html: `<div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;color:#222"><header style="padding:20px;background:#8F0E2F;color:#fff"><h1 style="font-size:20px;margin:0">${BRAND.NAME} · New chat message</h1></header><main style="padding:22px;border:1px solid #eee"><p><strong>From:</strong> ${safeName}</p><p><strong>Contact email:</strong> ${safeEmail}</p><p><strong>Conversation:</strong> ${safeRoomId}</p><div style="padding:14px;background:#f7f7f7;border-left:3px solid #B1123B;white-space:pre-wrap;overflow-wrap:anywhere">${messagePreview}</div><p style="margin-top:20px"><a href="${escapeEmailHtml(chatUrl)}" style="display:inline-block;padding:11px 18px;background:#B1123B;color:#fff;text-decoration:none;border-radius:5px">Open conversation</a></p></main></div>`,
+    text: `New chat message from ${senderName || 'Customer'}\nContact email: ${guestEmail || 'Not provided'}\nConversation: ${roomId || ''}\n\n${String(text || '').trim().slice(0, 1200) || (image ? 'The customer sent an image.' : 'The customer sent a message.')}\n\n${chatUrl}`,
   });
 };
 
@@ -986,8 +997,11 @@ const sendEmail = async (to, template, data) => {
       subject: emailContent.subject,
       html: emailContent.html
     };
+    const adminRecipients = data?.notifySuperAdmins === true
+      ? (await getAdminNotificationEmails(data.adminPermission)).filter((email) => email !== String(to).trim().toLowerCase())
+      : [];
     if (data?.notifySuperAdmins === true) {
-      await addSuperAdminBcc(mailOptions, [to]);
+      await addAdminNotificationBcc(mailOptions, [to], data.adminPermission);
     }
     if (template === 'posOrderConfirmation' && Buffer.isBuffer(data.invoicePdf) && data.invoicePdf.length > 0) {
       const orderNumber = String(data.order?.orderNumber || 'receipt').replace(/[^a-zA-Z0-9_-]/g, '');
@@ -999,8 +1013,25 @@ const sendEmail = async (to, template, data) => {
     }
 
     const result = await sendBrandedEmail(mailOptions);
+    const rejectedRecipients = (result.rejected || []).map((recipient) => String(recipient).trim().toLowerCase());
+    const rejectedAdmins = adminRecipients.filter((email) => rejectedRecipients.includes(email));
+    if (rejectedAdmins.length) {
+      console.error(`Email sent to ${to}, but ${rejectedAdmins.length} admin email copy recipient(s) were rejected.`);
+    }
+    const rejectedCustomer = rejectedRecipients.includes(String(to).trim().toLowerCase());
     console.log(`✅ Email sent successfully to ${to}: ${template}`);
-    return { success: true, messageId: result.messageId };
+    return {
+      success: !rejectedCustomer,
+      messageId: result.messageId,
+      ...(rejectedCustomer ? { message: 'The customer email recipient was rejected by the SMTP server.' } : {}),
+      ...(data?.notifySuperAdmins === true ? {
+        adminNotification: {
+          success: rejectedAdmins.length === 0,
+          recipientCount: adminRecipients.length,
+          rejectedCount: rejectedAdmins.length,
+        },
+      } : {}),
+    };
   } catch (error) {
     console.error(`❌ Failed to send email to ${to}:`, error.message);
     return { success: false, error: error.message, message: error.message };
@@ -1008,7 +1039,7 @@ const sendEmail = async (to, template, data) => {
 };
 
 // Send a free-form email (admin replies, custom notices) through the server email account
-const sendCustomEmail = async ({ to, subject, html, text, notifySuperAdmins = false }) => {
+const sendCustomEmail = async ({ to, subject, html, text, notifySuperAdmins = false, adminPermission = null }) => {
   try {
     if (!process.env.EMAIL_USER || !process.env.EMAIL_PASSWORD) {
       console.log('⚠️ Email credentials not configured. Skipping email send.');
@@ -1025,11 +1056,31 @@ const sendCustomEmail = async ({ to, subject, html, text, notifySuperAdmins = fa
       html,
       text
     };
-    if (notifySuperAdmins) await addSuperAdminBcc(mailOptions, [to]);
+    const adminRecipients = notifySuperAdmins
+      ? (await getAdminNotificationEmails(adminPermission)).filter((email) => email !== String(to).trim().toLowerCase())
+      : [];
+    if (notifySuperAdmins) await addAdminNotificationBcc(mailOptions, [to], adminPermission);
 
     const result = await sendBrandedEmail(mailOptions);
+    const rejectedRecipients = (result.rejected || []).map((recipient) => String(recipient).trim().toLowerCase());
+    const rejectedAdmins = adminRecipients.filter((email) => rejectedRecipients.includes(email));
+    if (rejectedAdmins.length) {
+      console.error(`Customer email sent, but ${rejectedAdmins.length} admin email copy recipient(s) were rejected.`);
+    }
+    const rejectedCustomer = rejectedRecipients.includes(String(to).trim().toLowerCase());
     console.log(`✅ Custom email sent to ${to}: ${subject}`);
-    return { success: true, messageId: result.messageId };
+    return {
+      success: !rejectedCustomer,
+      messageId: result.messageId,
+      ...(rejectedCustomer ? { message: 'The customer email recipient was rejected by the SMTP server.' } : {}),
+      ...(notifySuperAdmins ? {
+        adminNotification: {
+          success: rejectedAdmins.length === 0,
+          recipientCount: adminRecipients.length,
+          rejectedCount: rejectedAdmins.length,
+        },
+      } : {}),
+    };
   } catch (error) {
     console.error(`❌ Failed to send custom email to ${to}:`, error.message);
     return { success: false, error: error.message, message: error.message };
@@ -1064,20 +1115,31 @@ const sendDigitalProductCodesEmail = async ({ user, order, itemGroups, isManualF
   const intro = isManualFulfillment
     ? `Here are the digital access details for order <strong>#${safeOrderId}</strong>. Keep them private:`
     : `Payment for order <strong>#${safeOrderId}</strong> is confirmed. Keep these redemption codes private:`;
-  return sendCustomEmail({
+  const result = await sendCustomEmail({
     to: user.email,
     subject: `${BRAND.NAME} digital delivery — Order #${order?.orderId || ''}`,
     html: `<div style="font-family:Arial,sans-serif;max-width:620px;margin:0 auto;color:#1b1b1b"><div style="padding:24px"><h2 style="color:#8F0E2F">${heading}</h2><p>Hello ${name},</p><p>${intro}</p><p style="font-size:13px;color:#666">To copy a code or access detail, select the text in this email and choose Copy. Email apps block clipboard buttons, so the values are shown directly for easy selection.</p>${htmlItems}<p style="color:#666;font-size:12px">If you need help, contact our support team and mention order #${safeOrderId}.</p></div></div>`,
     text: `Hello ${user?.firstName || user?.fullName || 'there'}, your digital delivery details for order #${order?.orderId || ''} are below. Keep them private.\n\n${textItems}\n\nSelect and copy codes or access details directly from this email.`,
   });
+  if (!result.success) return result;
+
+  // Notify admins that fulfillment was emailed, but never copy redemption
+  // codes, passwords, PINs, or other customer access credentials.
+  const adminResult = await sendAdminOrderNotification(order, user, 'digital_delivery_sent');
+  if (!adminResult.success) {
+    console.warn(`Digital fulfillment was emailed for order #${order?.orderId}, but the admin notification failed: ${adminResult.message}`);
+  }
+  return { ...result, adminNotification: adminResult };
 };
 
 // Send order confirmation email
 const sendCustomerOrderEmail = async (order, user, template, adminEvent) => {
-  const result = await sendEmail(user?.email, template, { order, user });
-  const adminResult = await sendAdminOrderNotification(order, user, adminEvent);
+  const [result, adminResult] = await Promise.all([
+    sendEmail(user?.email, template, { order, user }),
+    sendAdminOrderNotification(order, user, adminEvent),
+  ]);
   if (!adminResult.success) console.warn(`Admin notification was not sent for order #${order?.orderId}: ${adminResult.message}`);
-  return result;
+  return { ...result, adminNotification: adminResult };
 };
 
 const sendOrderConfirmation = async (order, user) => {
@@ -1457,7 +1519,11 @@ const sendOrderInvoicePdf = async (order, user, pdfBuffer) => {
       }],
     };
     const result = await sendBrandedEmail(mailOptions);
-    return { success: true, messageId: result.messageId };
+    const adminNotification = await sendAdminOrderNotification(order, user, 'invoice_emailed');
+    if (!adminNotification.success) {
+      console.warn(`Invoice was emailed for order #${order.orderId}, but the admin notification failed: ${adminNotification.message}`);
+    }
+    return { success: true, messageId: result.messageId, adminNotification };
   } catch (error) {
     console.error('Error emailing order invoice PDF:', error);
     return { success: false, message: error.message };
@@ -1474,6 +1540,7 @@ const sendPOSReceipt = async (posOrder, invoicePdf = null) => {
     user: null,
     invoicePdf,
     notifySuperAdmins: true,
+    adminPermission: 'posOrders',
   });
 };
 
@@ -1563,10 +1630,14 @@ const sendUserAccountDetails = async ({ to, name, email, userName, password, pho
 
 module.exports = {
   sendEmail,
+  verifyEmailConnection,
   sendCustomEmail,
   sendLoyaltyTierEmail,
   sendSuperAdminNotification,
+  getAdminNotificationRecipientCount,
+  sendAdminEmailTest,
   sendAdminOrderNotification,
+  sendAdminChatMessageNotification,
   sendAccountCredentials,
   sendUserAccountDetails,
   sendOrderConfirmation,

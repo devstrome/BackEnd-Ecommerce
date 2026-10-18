@@ -106,6 +106,7 @@ router.post('/admin/wishlists/send-email', authenticateAdmin, async (req, res) =
       html,
       text: message,
       notifySuperAdmins: true,
+      adminPermission: 'wishlists',
     });
     if (!result.success) {
       return res.status(502).json({ message: result.message || result.error || 'Failed to send email' });

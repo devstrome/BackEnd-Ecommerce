@@ -14,7 +14,7 @@ const MessageSchema = new mongoose.Schema({
   },
   senderType: {
     type: String,
-    enum: ['customer', 'admin'],
+    enum: ['customer', 'admin', 'guest'],
     required: true
   },
   text: {
@@ -33,7 +33,7 @@ const MessageSchema = new mongoose.Schema({
     _id: false,
     emoji: { type: String, required: true },
     userId: { type: String, required: true },
-    senderType: { type: String, enum: ['customer', 'admin'], default: 'customer' },
+    senderType: { type: String, enum: ['customer', 'admin', 'guest'], default: 'customer' },
     userName: { type: String, default: "" },
     createdAt: { type: Date, default: Date.now }
   }],
@@ -62,7 +62,7 @@ const MessageSchema = new mongoose.Schema({
   readBy: [{
     readerType: {
       type: String,
-      enum: ['customer', 'admin'],
+      enum: ['customer', 'admin', 'guest'],
       required: true
     },
     readerId: {
@@ -81,7 +81,12 @@ const MessageSchema = new mongoose.Schema({
 }, { _id: true });
 
 const ChatRoomSchema = new mongoose.Schema({
-  customerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  customerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+  guestObjectId: { type: mongoose.Schema.Types.ObjectId, default: null, index: true },
+  guestId: { type: String, default: '', index: true },
+  guestName: { type: String, trim: true, maxlength: 100, default: '' },
+  guestEmail: { type: String, trim: true, lowercase: true, maxlength: 254, default: '' },
+  guestPhone: { type: String, trim: true, maxlength: 40, default: '' },
   assignedAdmin: { type: mongoose.Schema.Types.ObjectId, ref: "Admin", default: null },
   isClosed: { type: Boolean, default: false },
   closedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Admin" },

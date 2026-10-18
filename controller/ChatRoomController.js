@@ -1,7 +1,17 @@
 const ChatRoom = require("../models/ChatRoom");
 const { NotFoundError, BadRequestError } = require("../errors/errors");
 const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
 const { customerOwnsRoom } = require('../utils/chatRoomAccess');
+
+const notifyAdminsOfChatMessage = (payload) => {
+  const { sendAdminChatMessageNotification } = require('../utils/emailService');
+  sendAdminChatMessageNotification(payload)
+    .then((result) => {
+      if (!result.success) console.error('Chat message saved, but admin email notification failed:', result.message);
+    })
+    .catch((error) => console.error('Chat message admin email notification failed:', error.message));
+};
 
 exports.getOrCreateRoom = async (req, res) => {
   try {
@@ -44,6 +54,71 @@ exports.getOrCreateRoom = async (req, res) => {
     res.status(err.statusCode || 500).json({ 
       message: err.message || 'Server error' 
     });
+  }
+};
+
+// Public guest chat creation. The signed token becomes the guest's capability
+// to reconnect to only this conversation; client-supplied IDs never establish
+// room ownership.
+exports.createGuestRoom = async (req, res) => {
+  try {
+    if (!process.env.JWT_SECRET) {
+      return res.status(503).json({ success: false, message: 'Guest chat is temporarily unavailable.' });
+    }
+
+    const guestName = String(req.body?.guestName || '').trim().slice(0, 100);
+    const guestEmail = String(req.body?.guestEmail || '').trim().toLowerCase().slice(0, 254);
+    const guestPhone = String(req.body?.guestPhone || '').trim().slice(0, 40);
+    if (!guestName) return res.status(400).json({ success: false, message: 'Your name is required to start a chat.' });
+    if (guestEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(guestEmail)) {
+      return res.status(400).json({ success: false, message: 'Enter a valid email address.' });
+    }
+
+    const existingToken = String(req.body?.guestToken || '').trim();
+    if (existingToken) {
+      try {
+        const claims = jwt.verify(existingToken, process.env.JWT_SECRET);
+        if (claims?.guestChat === true && mongoose.isValidObjectId(claims.roomId) && mongoose.isValidObjectId(claims.guestObjectId)) {
+          const existingRoom = await ChatRoom.findOne({
+            _id: claims.roomId,
+            guestObjectId: claims.guestObjectId,
+            guestId: claims.guestId,
+            isClosed: false,
+          }).populate('assignedAdmin', 'firstName lastName email imageUrl');
+          if (existingRoom) {
+            return res.json({ success: true, room: existingRoom, guestToken: existingToken });
+          }
+        }
+      } catch {
+        // An expired token starts a fresh session; invalid client claims are not
+        // used to look up or access any room.
+      }
+    }
+
+    const guestObjectId = new mongoose.Types.ObjectId();
+    const guestId = require('crypto').randomBytes(24).toString('hex');
+    const room = await ChatRoom.create({
+      guestObjectId,
+      guestId,
+      guestName,
+      guestEmail,
+      guestPhone,
+      messages: [],
+    });
+    await room.populate('assignedAdmin', 'firstName lastName email imageUrl');
+    const guestToken = jwt.sign({
+      guestChat: true,
+      roomId: String(room._id),
+      guestObjectId: String(guestObjectId),
+      guestId,
+    }, process.env.JWT_SECRET, { expiresIn: '30d' });
+
+    const io = req.app.get('socketio');
+    if (io) io.to('adminRoom').emit('newChatRoom', room);
+    return res.status(201).json({ success: true, room, guestToken });
+  } catch (error) {
+    console.error('Error creating guest chat room:', error.message);
+    return res.status(500).json({ success: false, message: 'Could not start chat. Please try again.' });
   }
 };
 
@@ -115,6 +190,16 @@ exports.sendMessage = async (req, res) => {
     // Get the saved message with proper _id
     const savedMessage = room.messages[room.messages.length - 1];
 
+    if (senderType === 'customer') {
+      notifyAdminsOfChatMessage({
+        roomId,
+        senderName: newMessage.senderName,
+        guestEmail: req.user?.email,
+        text: normalizedText,
+        image: normalizedImage,
+      });
+    }
+
     // Emit via socket
     const io = req.app.get('socketio');
     if (io) {
@@ -154,7 +239,7 @@ exports.autoAssignAdmin = async (req, res) => {
     const unassignedRoom = await ChatRoom.findOne({ 
       assignedAdmin: null, 
       isClosed: false 
-    }).populate('customerId', 'firstName lastName');
+    }).populate('customerId', 'firstName lastName').select('+guestName');
 
     if (!unassignedRoom) {
       return res.json({ message: "No unassigned rooms available" });
@@ -170,7 +255,7 @@ exports.autoAssignAdmin = async (req, res) => {
       senderId: adminId,
       senderType: "admin",
       senderName: adminName,
-      text: `Hello ${unassignedRoom.customerId.firstName || 'there'}! ${adminName} speaking, how can I help you today?`,
+      text: `Hello ${unassignedRoom.customerId?.firstName || unassignedRoom.guestName || 'there'}! ${adminName} speaking, how can I help you today?`,
       reaction: "",
       readBy: [{
         readerType: "admin",

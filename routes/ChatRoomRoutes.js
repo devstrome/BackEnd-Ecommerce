@@ -4,7 +4,7 @@ const ChatController = require("../controller/ChatRoomController");
 const { authenticateAdmin } = require("../middleware/AdminAuthMiddleware");
 const authenticate = require("../middleware/UserAuthMiddleware");
 const upload = require("../config/multerconfig");
-const { chatMessageLimiter } = require('../middleware/securityHardening');
+const { chatMessageLimiter, guestChatStartLimiter } = require('../middleware/securityHardening');
 
 // Chat image upload (authenticated customer) - CloudinaryStorage returns the URL
 router.post("/user/upload/chat-image", authenticate, upload.single("image"), (req, res) => {
@@ -14,6 +14,7 @@ router.post("/user/upload/chat-image", authenticate, upload.single("image"), (re
 
 // Customer Routes
 router.get("/user/rooms/:customerId", authenticate, ChatController.getOrCreateRoom);
+router.post("/guest/rooms", guestChatStartLimiter, ChatController.createGuestRoom);
 
 // Shared Routes
 router.post("/user/rooms/:roomId/message", authenticate, chatMessageLimiter, ChatController.sendMessage);

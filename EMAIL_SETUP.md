@@ -30,24 +30,15 @@ EMAIL_PASSWORD=your_app_password_here
    - Generate a new app password for "Mail"
    - Use this password in `EMAIL_PASSWORD`
 
-## Render setup
+## Admin recipients
 
-Render's free web services block outbound SMTP traffic on ports 25, 465, and 587, so Gmail SMTP will time out there. The backend now supports the Resend HTTPS API, which works over port 443:
+Admin notification recipients come from active administrator accounts in MongoDB. Superadmins receive every operational notice. Other admins receive only notices for their assigned permission areas (for example, Inbox for chat, Orders for order events, and Contact messages for contact-form submissions). No static recipient-list environment variable is needed. Assign the matching permission to an admin account to include it in that area's notifications.
 
-1. Add and verify `belorella.com` (or a sending subdomain) in Resend and publish the DNS records Resend provides.
-2. Create a Resend API key.
-3. In the Render backend service's **Environment** settings, add:
+## Render and VPS networking
 
-   ```env
-   RESEND_API_KEY=re_...
-   RESEND_FROM_EMAIL=BELORELLA <orders@belorella.com>
-   ```
+This project now uses Gmail SMTP only. Render Free blocks outbound SMTP, including port 587, so Gmail SMTP will not work on that plan. Use a host that allows outbound TCP 587 (such as the planned VPS/AWS deployment), then set `EMAIL_USER` and a newly generated Gmail App Password in `EMAIL_PASSWORD`. Remove old `RESEND_API_KEY` and `RESEND_FROM_EMAIL` settings; they are no longer read by the application.
 
-   Use an actual sender address on the verified domain. Keep `EMAIL_USER` and `EMAIL_PASSWORD` out of the Resend API setup; when `RESEND_API_KEY` is present, the app uses Resend for every email.
-4. Save the environment settings and redeploy/restart the backend.
-5. Send a test order email, then inspect the Resend email logs if it is accepted but does not reach the inbox.
-
-On a paid Render instance or your future VPS, you can continue using Gmail SMTP with `EMAIL_SERVICE`, `EMAIL_USER`, and a Gmail app password. If `RESEND_API_KEY` remains set, the app will keep using Resend until that key is removed.
+After deployment, a signed-in admin can call `POST /api/cron/email-config/verify` to check Gmail SMTP authentication without sending a message. A superadmin can call `POST /api/cron/email-config/test-admin` to send a real delivery check to active admins across assigned areas. `GET /api/cron/email-config` reports whether email and notification recipients are configured.
 
 ## Cron Job Schedule
 
@@ -111,9 +102,10 @@ emailSent: {
 
 ### Emails not sending
 
-1. On Render Free, confirm `RESEND_API_KEY` and `RESEND_FROM_EMAIL` are set on the backend service and the sender domain is verified.
-2. Check Render logs for the provider error and Resend's email logs for delivery events.
-3. For SMTP hosting, verify the provider credentials and confirm outbound SMTP is allowed by the host.
+1. Confirm the host allows outbound TCP 587 and that `EMAIL_USER` plus a Gmail App Password are set.
+2. Call `POST /api/cron/email-config/verify` and check server logs for the SMTP connection error.
+3. Confirm the intended administrators are active in MongoDB and have the matching permission assigned. Superadmins receive all areas.
+4. For message/order delivery, check the backend logs for notification failure details and the Gmail Sent folder / recipient spam folder.
 
 ### Cron jobs not running
 

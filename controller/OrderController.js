@@ -1117,34 +1117,39 @@ module.exports.adminCreateOrder = async (req, res) => {
     publishDigitalStockUpdates(digitalStockUpdates);
     notifyOrderUpdate(savedOrder, 'create');
 
-    // Send order confirmation email (never fail order creation if email fails)
-    let emailSent = false;
-    try {
-      const emailResult = await sendOrderConfirmation(savedOrder, {
-        fullName: shippingAddress.fullName,
-        email: recipientEmail,
-      });
-      emailSent = !!emailResult.success;
-      if (emailSent) {
-        await Order.updateOne({ _id: savedOrder._id }, { $set: { emailSent: 'confirmation' } });
-        savedOrder.emailSent = 'confirmation';
-        console.log(`✅ Admin order confirmation email sent for #${savedOrder.orderId} → ${recipientEmail}`);
-      } else {
-        console.warn(`⚠️ Failed to send admin order confirmation email for #${savedOrder.orderId}: ${emailResult.message || emailResult.error}`);
+    // SMTP can take several seconds to connect on hosted services. Start mail
+    // after the order is committed so a slow mail server cannot hold checkout.
+    setImmediate(async () => {
+      try {
+        const emailResult = await sendOrderConfirmation(savedOrder, {
+          fullName: shippingAddress.fullName,
+          email: recipientEmail,
+        });
+        if (emailResult.success) {
+          await Order.updateOne({ _id: savedOrder._id }, { $set: { emailSent: 'confirmation' } });
+          console.log(`Order confirmation email accepted for #${savedOrder.orderId}`);
+        } else {
+          console.warn(`Order confirmation email failed for #${savedOrder.orderId}: ${emailResult.message || emailResult.error}`);
+        }
+        if (emailResult.adminNotification?.success) {
+          console.log(`Admin order notification accepted for #${savedOrder.orderId}`);
+        }
+
+        if (savedOrder.paymentStatus === 'completed' && savedOrder.items.some((item) => item.isDigitalProduct)) {
+          const fulfillmentUser = { ...user, fullName: shippingAddress.fullName || user.fullName, email: recipientEmail };
+          const digitalResult = await sendOrderDigitalCodes(savedOrder, fulfillmentUser);
+          if (!digitalResult.success) console.error(`Digital fulfillment email was not sent for order #${savedOrder.orderId}: ${digitalResult.message}`);
+        }
+      } catch (emailError) {
+        console.error(`Order email processing failed for #${savedOrder.orderId}:`, emailError.message);
       }
-      if (savedOrder.paymentStatus === 'completed' && savedOrder.items.some((item) => item.isDigitalProduct)) {
-        const fulfillmentUser = { ...user, fullName: shippingAddress.fullName || user.fullName, email: recipientEmail };
-        const digitalResult = await sendOrderDigitalCodes(savedOrder, fulfillmentUser);
-        if (!digitalResult.success) console.error(`Digital fulfillment email was not sent for admin order #${savedOrder.orderId}: ${digitalResult.message}`);
-      }
-    } catch (emailError) {
-      console.error(`⚠️ Error sending admin order confirmation email for #${savedOrder.orderId}:`, emailError.message);
-    }
+    });
 
     return res.status(201).json({
       order: savedOrder,
       orderId: savedOrder.orderId,
-      emailSent,
+      emailSent: false,
+      emailQueued: true,
       warnings: ruleEval.blockers, // checkout rules the admin overrode
     });
   } catch (err) {

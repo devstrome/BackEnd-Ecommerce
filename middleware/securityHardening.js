@@ -50,6 +50,12 @@ const chatMessageLimiter = createLimiter({
   message: 'You are sending messages too quickly. Please wait a moment.',
 });
 
+const guestChatStartLimiter = createLimiter({
+  windowMs: 60 * 60 * 1000,
+  limit: 8,
+  message: 'Too many new chat sessions. Please try again later.',
+});
+
 module.exports = {
   authLimiter,
   otpLimiter,
@@ -57,4 +63,5 @@ module.exports = {
   subscriberLimiter,
   newsletterSendLimiter,
   chatMessageLimiter,
+  guestChatStartLimiter,
 };

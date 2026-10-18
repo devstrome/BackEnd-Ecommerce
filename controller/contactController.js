@@ -62,14 +62,16 @@ exports.submitContact = catchAsyncErrors(async (req, res, next) => {
         <p style="font-size:12px;color:#777">Contact reference: ${escapeHtml(contact._id)}</p>
       </div>
     </div>`;
-  const notificationResult = await sendSuperAdminNotification({
+  sendSuperAdminNotification({
     subject: `New contact message: ${String(subject || 'Contact form').replace(/[\r\n]/g, ' ').slice(0, 120)}`,
+    permission: 'contacts',
     html: notificationHtml,
     text: `New contact message from ${name} (${email})\nSubject: ${subject}\n\n${message}\n\nContact reference: ${contact._id}`,
-  });
-  if (!notificationResult.success) {
-    console.error('Contact message saved, but superadmin email notification failed:', notificationResult.message);
-  }
+  }).then((notificationResult) => {
+    if (!notificationResult.success) {
+      console.error('Contact message saved, but admin email notification failed:', notificationResult.message);
+    }
+  }).catch((error) => console.error('Contact message admin email notification failed:', error.message));
 
   res.status(201).json({
     success: true,
@@ -324,6 +326,7 @@ exports.replyToContact = catchAsyncErrors(async (req, res, next) => {
     html: buildReplyHtml(contact, subject, message),
     text: message,
     notifySuperAdmins: true,
+    adminPermission: 'contacts',
   });
 
   if (!result.success) {

@@ -172,11 +172,37 @@ const io = socketIO(server, {
 // identity-bearing events use the same signed, active access tokens as HTTP.
 io.use(async (socket, next) => {
   const token = socket.handshake.auth?.token;
-  if (!token) {
+  const guestToken = socket.handshake.auth?.guestToken;
+  if (!token && !guestToken) {
     socket.data = { isAuthenticated: false, userType: 'guest' };
     return next();
   }
   try {
+    if (!token && guestToken) {
+      if (typeof guestToken !== 'string' || !process.env.JWT_SECRET) throw new Error('Invalid guest chat token');
+      const claims = jwt.verify(guestToken, process.env.JWT_SECRET);
+      if (claims?.guestChat !== true || !claims.roomId || !claims.guestId || !claims.guestObjectId) {
+        throw new Error('Invalid guest chat claims');
+      }
+      const guestRoom = await require('./models/ChatRoom').findById(claims.roomId)
+        .select('guestId guestObjectId guestName guestEmail isClosed')
+        .lean();
+      if (!guestRoom || guestRoom.isClosed
+        || guestRoom.guestId !== claims.guestId
+        || String(guestRoom.guestObjectId) !== String(claims.guestObjectId)) {
+        throw new Error('Guest chat session is unavailable');
+      }
+      socket.data = {
+        isAuthenticated: true,
+        userType: 'guest',
+        userId: String(guestRoom.guestObjectId),
+        guestId: guestRoom.guestId,
+        guestRoomId: String(guestRoom._id),
+        displayName: guestRoom.guestName || 'Guest',
+        email: guestRoom.guestEmail || '',
+      };
+      return next();
+    }
     if (typeof token !== 'string' || !process.env.JWT_SECRET) throw new Error('Invalid socket token');
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const isAdminToken = Boolean(decoded.adminId);
@@ -185,8 +211,8 @@ io.use(async (socket, next) => {
 
     const Model = isAdminToken ? Admin : User;
     const identityFields = isAdminToken
-      ? 'accessTokens banned firstName lastName fullName superAdmin permissions'
-      : 'accessTokens banned firstName lastName fullName';
+      ? 'accessTokens banned firstName lastName fullName superAdmin permissions email'
+      : 'accessTokens banned firstName lastName fullName email';
     const identity = await Model.findById(identityId)
       .select(identityFields)
       .lean();
@@ -199,6 +225,7 @@ io.use(async (socket, next) => {
       userType: isAdminToken ? 'admin' : 'customer',
       userId: String(identityId),
       displayName: identity.fullName || [identity.firstName, identity.lastName].filter(Boolean).join(' '),
+      email: identity.email || '',
       canViewOrders: Boolean(isAdminToken && (identity.superAdmin || identity.permissions?.includes('orders'))),
     };
     return next();
@@ -232,6 +259,7 @@ const userOnlineStatus = new Map();
 const socketUserPresence = new Map();
 const isSocketAdmin = (socket) => socket.data?.isAuthenticated && socket.data.userType === 'admin';
 const isSocketCustomer = (socket) => socket.data?.isAuthenticated && socket.data.userType === 'customer';
+const isSocketGuest = (socket) => socket.data?.isAuthenticated && socket.data.userType === 'guest' && Boolean(socket.data.guestRoomId);
 const allowChatMutation = (socket) => {
   const now = Date.now();
   const current = socket.data?.chatMutationWindow;
@@ -252,7 +280,11 @@ const isSafeChatImage = (value) => {
   }
 };
 const socketOwnsChatRoom = (socket, room) => isSocketAdmin(socket)
-  || (isSocketCustomer(socket) && String(room?.customerId?._id || room?.customerId) === socket.data.userId);
+  || (isSocketCustomer(socket) && String(room?.customerId?._id || room?.customerId) === socket.data.userId)
+  || (isSocketGuest(socket)
+    && String(room?._id) === socket.data.guestRoomId
+    && String(room?.guestObjectId) === socket.data.userId
+    && room?.guestId === socket.data.guestId);
 
 const emitUserOnlineStatus = (userId, isOnline) => {
   io.to('adminRoom').emit('userOnlineStatus', {
@@ -400,16 +432,17 @@ io.on('connection', (socket) => {
   socket.on('joinChatRoom', async (payload = {}) => {
     if (!allowChatMutation(socket)) return;
     const { roomId, userId, userType } = payload;
-    if (!roomId || !['admin', 'customer'].includes(userType)) {
+    if (!roomId || !['admin', 'customer', 'guest'].includes(userType)) {
       return;
     }
 
     try {
       const ChatRoom = require('./models/ChatRoom');
-      const room = await ChatRoom.findById(roomId).select('customerId');
+      const room = await ChatRoom.findById(roomId).select('customerId guestId guestObjectId');
       if (!room || !socketOwnsChatRoom(socket, room)) return;
       if (userType === 'admin' && !isSocketAdmin(socket)) return;
       if (userType === 'customer' && (!isSocketCustomer(socket) || String(userId) !== socket.data.userId)) return;
+      if (userType === 'guest' && (!isSocketGuest(socket) || String(roomId) !== socket.data.guestRoomId)) return;
     } catch {
       return;
     }
@@ -417,7 +450,7 @@ io.on('connection', (socket) => {
     socket.join(`chat_${roomId}`);
     
     if (userType === 'admin') {
-      connectedUsers.set(socket.id, { userId: socket.data.userId, userType, roomId });
+      connectedUsers.set(socket.id, { userId: socket.data.userId, guestId: socket.data.guestId, userType, roomId });
       console.log(`🛡️ Admin joined chat_${roomId}`);
     } else {
       // For user connections, userId is required
@@ -447,7 +480,7 @@ io.on('connection', (socket) => {
     const senderType = socket.data?.userType;
     const hasText = typeof text === 'string' && text.trim().length > 0;
     const hasImage = typeof image === 'string' && image.trim().length > 0;
-    if (!socket.data?.isAuthenticated || !['admin', 'customer'].includes(senderType) || !roomId || !senderId || (!hasText && !hasImage)) {
+    if (!socket.data?.isAuthenticated || !['admin', 'customer', 'guest'].includes(senderType) || !roomId || !senderId || (!hasText && !hasImage)) {
       ack({ success: false, error: 'Message could not be sent. Please reconnect and try again.' });
       return;
     }
@@ -466,6 +499,7 @@ io.on('connection', (socket) => {
       let retries = 3;
       let room = null;
       let savedMessage = null;
+      let createdNewMessage = false;
       
       while (retries > 0) {
         try {
@@ -507,6 +541,7 @@ io.on('connection', (socket) => {
             reaction: "",
             reactions: [],
             clientMessageId,
+            guestId: senderType === 'guest' ? socket.data.guestId : '',
             readBy: [{
               readerType: senderType,
               readerId: senderId,
@@ -521,6 +556,7 @@ io.on('connection', (socket) => {
           
           // Get the saved message with proper _id
           savedMessage = room.messages[room.messages.length - 1];
+          createdNewMessage = true;
           
           break; // Success, exit retry loop
           
@@ -556,6 +592,19 @@ io.on('connection', (socket) => {
         });
 
         ack({ success: true, tempId: clientMessageId, messageId: String(savedMessage._id) });
+
+        if (createdNewMessage && senderType !== 'admin') {
+          const { sendAdminChatMessageNotification } = require('./utils/emailService');
+          sendAdminChatMessageNotification({
+            roomId,
+            senderName: socket.data.displayName || 'Customer',
+            guestEmail: socket.data.email || '',
+            text: hasText ? text : '',
+            image: hasImage ? image : '',
+          }).then((result) => {
+            if (!result.success) console.error('Chat message saved, but admin email notification failed:', result.message);
+          }).catch((error) => console.error('Chat message admin email notification failed:', error.message));
+        }
         
         console.log(`✉️ Message saved and sent to chat_${roomId} by ${senderId} (${senderType})`);
       } else {
@@ -853,7 +902,7 @@ io.on('connection', (socket) => {
     if (!socket.data?.isAuthenticated || !roomId || !userId) return;
     try {
       const ChatRoom = require('./models/ChatRoom');
-      const room = await ChatRoom.findById(roomId).select('customerId');
+      const room = await ChatRoom.findById(roomId).select('customerId guestId guestObjectId');
       if (!room || !socketOwnsChatRoom(socket, room)) return;
       io.to(`chat_${roomId}`).emit('onlineStatusChanged', { roomId, userId, isOnline: true });
     } catch {
@@ -924,7 +973,7 @@ io.on('connection', (socket) => {
     if (!socket.data?.isAuthenticated || !roomId) return;
     try {
       const ChatRoom = require('./models/ChatRoom');
-      const room = await ChatRoom.findById(roomId).select('customerId');
+      const room = await ChatRoom.findById(roomId).select('customerId guestId guestObjectId');
       if (!room || !socketOwnsChatRoom(socket, room)) return;
       socket.to(`chat_${roomId}`).emit('userTyping', {
         roomId,

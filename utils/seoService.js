@@ -247,6 +247,12 @@ function buildSEO(product) {
   return makeSEO(product);
 }
 
+async function previewSEO(product) {
+  if (!product || typeof product !== 'object') return null;
+  const enrichedProduct = await withRegionNames(product);
+  return buildSEO(enrichedProduct);
+}
+
 function buildVariantSEO(product, variant) {
   if (!product || !variant) return null;
   return makeSEO(product, variant);
@@ -324,6 +330,7 @@ async function getSEOStats() {
 
 module.exports = {
   buildSEO,
+  previewSEO,
   buildVariantSEO,
   generateSEO,
   generateVariantSEO,

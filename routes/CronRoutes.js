@@ -159,18 +159,56 @@ router.post('/trigger/otp-cleanup', authenticateAdmin, async (req, res) => {
 });
 
 // Get email configuration status (Admin only)
-router.get('/email-config', authenticateAdmin, (req, res) => {
-  const config = {
-    emailUser: process.env.EMAIL_USER ? 'Configured' : 'Not configured',
-    emailPassword: process.env.EMAIL_PASSWORD ? 'Configured' : 'Not configured',
-    emailService: process.env.EMAIL_SERVICE || 'gmail'
-  };
-  
-  res.json({
-    success: true,
-    data: config,
-    message: 'Email configuration status retrieved'
-  });
+router.get('/email-config', authenticateAdmin, async (req, res) => {
+  try {
+    const { getAdminNotificationRecipientCount } = require('../utils/emailService');
+    const adminRecipientCount = await getAdminNotificationRecipientCount();
+    const config = {
+      emailUser: process.env.EMAIL_USER ? 'Configured' : 'Not configured',
+      emailPassword: process.env.EMAIL_PASSWORD ? 'Configured' : 'Not configured',
+      emailService: 'Gmail SMTP',
+      adminRecipients: adminRecipientCount ? 'Configured' : 'Not configured',
+      adminRecipientCount,
+    };
+    return res.json({ success: true, data: config, message: 'Email configuration status retrieved' });
+  } catch (error) {
+    console.error('Unable to read email configuration:', error.message);
+    return res.status(500).json({ success: false, message: 'Unable to read email configuration.' });
+  }
+});
+
+// Verify DNS, connection, TLS and Gmail SMTP authentication without sending mail.
+router.post('/email-config/verify', authenticateAdmin, async (req, res) => {
+  try {
+    const { verifyEmailConnection } = require('../utils/emailService');
+    await verifyEmailConnection();
+    return res.json({ success: true, message: 'Gmail SMTP connection verified.' });
+  } catch (error) {
+    console.error('Gmail SMTP verification failed:', error.message);
+    return res.status(502).json({
+      success: false,
+      message: error.message || 'Gmail SMTP verification failed.',
+    });
+  }
+});
+
+// Send a branded delivery check to active admins across assigned notification areas.
+router.post('/email-config/test-admin', authenticateAdmin, async (req, res) => {
+  try {
+    const { sendAdminEmailTest } = require('../utils/emailService');
+    const result = await sendAdminEmailTest();
+    if (!result.success) {
+      return res.status(502).json({ success: false, message: result.message || 'Admin email delivery check failed.' });
+    }
+    return res.json({
+      success: true,
+      message: 'Admin email delivery check accepted by Gmail SMTP.',
+      recipientCount: result.recipientCount,
+    });
+  } catch (error) {
+    console.error('Admin email delivery check failed:', error.message);
+    return res.status(502).json({ success: false, message: error.message || 'Admin email delivery check failed.' });
+  }
 });
 
 module.exports = router;

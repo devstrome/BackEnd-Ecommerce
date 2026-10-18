@@ -43,6 +43,29 @@ router.post('/seo/generate', authenticateAdmin, async (req, res) => {
   }
 });
 
+// Build a product SEO draft from the current admin form without saving it.
+// This supports generating metadata before the product has a database ID.
+router.post('/seo/preview/product', authenticateAdmin, async (req, res) => {
+  try {
+    const product = req.body?.product;
+    if (!product || typeof product !== 'object' || Array.isArray(product)) {
+      return res.status(400).json({ message: 'Product details are required to generate SEO.' });
+    }
+    if (!String(product.name || '').trim()) {
+      return res.status(400).json({ message: 'Add a product name before generating SEO.' });
+    }
+    if (Array.isArray(product.variants) && product.variants.length > 100) {
+      return res.status(400).json({ message: 'Too many variants to generate SEO.' });
+    }
+
+    const seo = await seoService.previewSEO(product);
+    if (!seo) return res.status(400).json({ message: 'Unable to generate SEO from these product details.' });
+    return res.json({ message: 'SEO draft generated', seo });
+  } catch (err) {
+    return res.status(500).json({ message: 'Failed to generate SEO draft', error: err.message });
+  }
+});
+
 // Generate SEO for a single product by ID
 router.post('/seo/product/:id', authenticateAdmin, async (req, res) => {
   try {
