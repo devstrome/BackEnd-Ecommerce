@@ -1,0 +1,41 @@
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+    commands:
+      - npm ci --omit=dev --no-audit --no-fund
+  build:
+    commands:
+      - node --check index.js
+      - echo "Backend source is ready for an EC2 deployment artifact. Runtime secrets are loaded from SSM on EC2."
+
+artifacts:
+  base-directory: .
+  files:
+    - '**/*'
+  exclude-paths:
+    - '.env'
+    - '.env.*'
+    - '**/.env'
+    - '**/.env.*'
+    - 'node_modules/**/*'
+    - '**/node_modules/**/*'
+    - '.git/**/*'
+    - '**/.git/**/*'
+    - 'coverage/**/*'
+    - '**/coverage/**/*'
+    - 'AGENTS.md'
+    - '**/AGENTS.md'
+    - '**/*.pem'
+    - '**/*.p12'
+    - '**/*.pfx'
+    - '**/*.key'
+
+cache:
+  paths:
+    - '/root/.npm/**/*'
