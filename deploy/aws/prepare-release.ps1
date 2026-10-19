@@ -18,7 +18,8 @@ function Copy-TrackedWorkspaceFiles([string]$RepoRoot, [string]$StageRoot, [stri
 
   foreach ($relativePath in $files) {
     $normalized = $relativePath.Replace('\', '/')
-    if ($normalized -match '(^|/)\.env($|\.)' -or
+    $fileName = [System.IO.Path]::GetFileName($normalized)
+    if ($fileName -eq '.env' -or ($fileName.StartsWith('.env.') -and $fileName -ne '.env.example') -or
         $normalized -match '(^|/)(node_modules|\.next|\.git|coverage|\.turbo)(/|$)' -or
         $normalized -match '(^|/)AGENTS\.md$' -or
         $normalized -match '(^|/)\.codex(/|$)' -or

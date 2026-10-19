@@ -35,22 +35,32 @@ $generator = @'
 const fs = require('fs');
 const path = require('path');
 const dotenv = require(path.join(process.argv[2], 'node_modules', 'dotenv'));
-const source = dotenv.parse(fs.readFileSync(path.join(process.argv[2], '.env')));
+const rawEnv = fs.readFileSync(path.join(process.argv[2], '.env'), 'utf8');
+const source = dotenv.parse(rawEnv);
 const required = ['DATABASE_URI', 'JWT_SECRET', 'JWT_REFRESH_SECRET', 'EMAIL_USER', 'EMAIL_PASSWORD', 'CLIENT_URL', 'SITE_URL'];
 const missing = required.filter((name) => !String(source[name] || '').trim());
 if (missing.length) throw new Error(`Missing required production settings: ${missing.join(', ')}`);
+let uploadEnv = rawEnv;
+function setEnvLine(name, value) {
+  const line = `${name}=${value}`;
+  const pattern = new RegExp(`^[ \\t]*${name}[ \\t]*=.*$`, 'm');
+  uploadEnv = pattern.test(uploadEnv)
+    ? uploadEnv.replace(pattern, line)
+    : `${uploadEnv.replace(/\s*$/, '')}\n${line}\n`;
+}
 if (process.argv[4]) {
   const origins = String(source.CLIENT_URL).split(',').map((origin) => origin.trim()).filter(Boolean);
   if (!origins.includes(process.argv[4])) origins.push(process.argv[4]);
   source.CLIENT_URL = origins.join(',');
+  setEnvLine('CLIENT_URL', source.CLIENT_URL);
 }
-source.TRUST_PROXY_HOPS = '2';
+setEnvLine('TRUST_PROXY_HOPS', '2');
 const payload = {
   Name: process.argv[3],
   Type: 'SecureString',
   Description: 'BELORELLA production backend environment',
   Overwrite: true,
-  Value: JSON.stringify(source),
+  Value: uploadEnv,
 };
 fs.writeFileSync(process.argv[5], JSON.stringify(payload), { mode: 0o600 });
 '@
